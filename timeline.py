@@ -1,12 +1,12 @@
-from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
-from PyQt6.QtWidgets import QWidget
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
+from PySide6.QtWidgets import QWidget
 
 
 class TimelineWidget(QWidget):
-    seek_requested = pyqtSignal(int)
-    segment_selected = pyqtSignal(int)
-    marker_selected = pyqtSignal(int)
+    seek_requested = Signal(int)
+    segment_selected = Signal(int)
+    marker_selected = Signal(int)
 
     def __init__(self):
         super().__init__()

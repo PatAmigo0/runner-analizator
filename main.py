@@ -4,9 +4,9 @@ import sys
 import time
 
 import cv2
-from PyQt6.QtCore import QMutex, Qt, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QFont, QImage, QPixmap
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import QMutex, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QImage, QPixmap
+from PySide6.QtWidgets import (
     QApplication,
     QColorDialog,
     QDoubleSpinBox,
@@ -33,9 +33,9 @@ from timeline import TimelineWidget
 
 # --- VIDEO THREAD ---
 class VideoThread(QThread):
-    change_pixmap_signal = pyqtSignal(object)
-    finished_signal = pyqtSignal()
-    video_info_signal = pyqtSignal(dict)
+    change_pixmap_signal = Signal(object)
+    finished_signal = Signal()
+    video_info_signal = Signal(dict)
 
     def __init__(self):
         super().__init__()
@@ -580,7 +580,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.calculate_stats()
         self.setFocus()
 
-    @pyqtSlot(object)
+    @Slot(object)
     def update_image(self, frame):
         self.current_frame = self.thread.current_frame_num
         h, w, ch = frame.shape
