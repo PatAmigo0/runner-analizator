@@ -2,4 +2,5 @@ __pycache__
 .vscode
 .idea
 main*
+!main.py
 venv_*
