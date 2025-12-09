@@ -1,4 +1,5 @@
 import copy
+import ctypes
 import json
 import os
 import sys
@@ -11,6 +12,7 @@ from PySide2.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QIcon,
     QImage,
     QKeySequence,
     QPainter,
@@ -43,9 +45,31 @@ from PySide2.QtWidgets import (
 )
 from timeline import TimelineWidget
 
-# dirname = os.path.dirname(psf)
-# plugin_path = os.path.join(dirname, "plugins", "platforms")
-# os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
+is_exe_version = 0
+if "__compiled__" not in globals():
+    import PySide2
+
+    dirname = os.path.dirname(PySide2.__file__)
+    plugin_path = os.path.join(dirname, "plugins", "platforms")
+    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
+    print(f"Debug: Запуск скрипта. Путь к плагинам установлен вручную: {plugin_path}")
+else:
+    is_exe_version = 1
+
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "arseni.kuskou.prosportsanalyzer.1.4"
+    )
+except ImportError:
+    pass
+
+
+def get_resource_path(relative_path):
+    try:
+        base_path = os.path.dirname(__file__)
+    except NameError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 
 # --- SETTINGS MANAGER ---
@@ -303,7 +327,7 @@ class ProSportsAnalyzer(QMainWindow):
         super().__init__()
         self.settings = SettingsManager()
 
-        self.setWindowTitle("Pro Sports Analyzer v1.3 [WIN8 SPECIAL BUILD]")
+        self.setWindowTitle(f"Pro Sports Analyzer v1.3.{is_exe_version} [PORTABLE]")
         self.resize(1600, 950)
         self.setAcceptDrops(True)
 
@@ -311,7 +335,6 @@ class ProSportsAnalyzer(QMainWindow):
             QMainWindow { background-color: #1e1e1e; color: #f0f0f0; font-family: Segoe UI; }
             QWidget { font-size: 14px; }
             
-            /* -- MESSAGE BOX FIX -- */
             QMessageBox { background-color: #2b2b2b; color: #f0f0f0; }
             QMessageBox QLabel { color: #f0f0f0; }
             QMessageBox QPushButton {
@@ -320,14 +343,12 @@ class ProSportsAnalyzer(QMainWindow):
             }
             QMessageBox QPushButton:hover { background-color: #4a4a4a; }
             
-            /* -- GROUP BOX -- */
             QGroupBox { 
                 border: 1px solid #444; margin-top: 20px; font-weight: bold; 
                 color: #ccc; background-color: #2b2b2b; border-radius: 3px; padding-top: 15px;
             }
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; left: 10px; color: #fff; }
             
-            /* -- BUTTONS -- */
             QPushButton { 
                 background-color: #3a3a3a; border: 1px solid #555; padding: 6px 12px; 
                 color: white; border-radius: 2px; 
@@ -336,27 +357,28 @@ class ProSportsAnalyzer(QMainWindow):
             QPushButton:pressed { background-color: #0078d7; border-color: #0078d7; }
             QPushButton:disabled { background-color: #2a2a2a; color: #555; border-color: #333; }
             
-            /* -- INPUTS -- */
             QLineEdit { background-color: #1e1e1e; color: #fff; padding: 4px; border: 1px solid #555; }
             QLineEdit:focus { border: 1px solid #0078d7; }
             
             QLabel { color: #e0e0e0; }
             
-            /* -- LISTS -- */
             QListWidget { background-color: #222; border: 1px solid #444; color: #ffffff; outline: none; }
             QListWidget::item { color: #ffffff; padding: 4px; }
-            QListWidget::item:hover { background-color: #333; }
-            QListWidget::item:selected { background-color: #0078d7; color: white; }
+            /* Убираем синий фон при наведении и выделении, оставляем только галочки */
+            QListWidget::item:hover { background-color: #2a2a2a; }
+            QListWidget::item:selected { background-color: #222; color: #ffffff; }
             
             QCheckBox { color: #ffffff; spacing: 5px; }
             QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid #666; background: #333; }
             QCheckBox::indicator:checked { background: #0078d7; border-color: #0078d7; }
 
-            /* -- SPINBOX -- */
+            /* SPINBOX FIX: selection-background-color совпадает с фоном */
             QDoubleSpinBox { 
                 background-color: #222; color: #fff; border: 1px solid #555; padding: 4px; 
-                selection-background-color: transparent; selection-color: #fff;
+                selection-background-color: #222; 
+                selection-color: #fff;
             }
+            QDoubleSpinBox:focus { border: 1px solid #0078d7; }
         """)
 
         # Data
@@ -387,17 +409,37 @@ class ProSportsAnalyzer(QMainWindow):
         self.formulas_window.set_context_callback(self.get_current_context)
 
         self.init_ui()
+        self.init_grips()
 
     def init_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        self.setWindowFlags(Qt.FramelessWindowHint)
+
+        icon_path = get_resource_path("favicon.ico")
+        self.setWindowIcon(QIcon(icon_path))
+
+        self.moving = False
+        self.offset = None
+
+        central_container = QWidget()
+        self.setCentralWidget(central_container)
+
+        main_window_layout = QVBoxLayout(central_container)
+        main_window_layout.setContentsMargins(0, 0, 0, 0)
+        main_window_layout.setSpacing(0)
+
+        self.title_bar = CustomTitleBar(self)
+        main_window_layout.addWidget(self.title_bar)
+
+        content_widget = QWidget()
+        main_window_layout.addWidget(content_widget)
+
+        main_layout = QVBoxLayout(content_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
 
         top_layout = QHBoxLayout()
 
-        # 1. LEFT PANEL
+        # LEFT PANEL
         left_panel = QWidget()
         left_panel.setFixedWidth(320)
         left_layout = QVBoxLayout(left_panel)
@@ -469,6 +511,7 @@ class ProSportsAnalyzer(QMainWindow):
         l_markers.addWidget(QLabel("Список меток (фильтр):"))
         self.list_filters = QListWidget()
         self.list_filters.setMinimumHeight(150)
+        self.list_filters.setSelectionMode(QListWidget.NoSelection)
         self.list_filters.itemChanged.connect(self.on_filter_changed)
         self.list_filters.setFocusPolicy(Qt.NoFocus)
         l_markers.addWidget(self.list_filters)
@@ -503,7 +546,7 @@ class ProSportsAnalyzer(QMainWindow):
         left_layout.addStretch()
         top_layout.addWidget(left_panel)
 
-        # 2. CENTER VIDEO
+        # CENTER VIDEO
         self.video_container = QWidget()
         self.video_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_container.setStyleSheet(
@@ -529,7 +572,7 @@ class ProSportsAnalyzer(QMainWindow):
 
         top_layout.addWidget(self.video_container, stretch=1)
 
-        # 3. RIGHT PANEL
+        # RIGHT PANEL
         right_panel = QWidget()
         right_panel.setFixedWidth(300)
         right_layout = QVBoxLayout(right_panel)
@@ -614,6 +657,64 @@ class ProSportsAnalyzer(QMainWindow):
 
         self.fix_focus_policies()
 
+    def init_grips(self):
+        self.grips = {}
+        # Создаем 4 стороны и 4 угла
+        self.grips["left"] = SideGrip(self, Qt.LeftEdge)
+        self.grips["right"] = SideGrip(self, Qt.RightEdge)
+        self.grips["top"] = SideGrip(self, Qt.TopEdge)
+        self.grips["bottom"] = SideGrip(self, Qt.BottomEdge)
+        self.grips["top_left"] = SideGrip(self, "top_left")
+        self.grips["top_right"] = SideGrip(self, "top_right")
+        self.grips["bottom_left"] = SideGrip(self, "bottom_left")
+        self.grips["bottom_right"] = SideGrip(self, "bottom_right")
+
+        # Делаем их прозрачными
+        for grip in self.grips.values():
+            grip.setStyleSheet("background-color: transparent;")
+            grip.raise_()  # Поднимаем наверх, чтобы они были поверх видео
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+
+        if not hasattr(self, "grips"):
+            return
+
+        rect = self.rect()
+        grip_size = 10 
+
+        # Расставляем стороны
+        self.grips["left"].setGeometry(
+            0, grip_size, grip_size, rect.height() - 2 * grip_size
+        )
+        self.grips["right"].setGeometry(
+            rect.width() - grip_size,
+            grip_size,
+            grip_size,
+            rect.height() - 2 * grip_size,
+        )
+        self.grips["top"].setGeometry(
+            grip_size, 0, rect.width() - 2 * grip_size, grip_size
+        )
+        self.grips["bottom"].setGeometry(
+            grip_size,
+            rect.height() - grip_size,
+            rect.width() - 2 * grip_size,
+            grip_size,
+        )
+
+        # Расставляем углы
+        self.grips["top_left"].setGeometry(0, 0, grip_size, grip_size)
+        self.grips["top_right"].setGeometry(
+            rect.width() - grip_size, 0, grip_size, grip_size
+        )
+        self.grips["bottom_left"].setGeometry(
+            0, rect.height() - grip_size, grip_size, grip_size
+        )
+        self.grips["bottom_right"].setGeometry(
+            rect.width() - grip_size, rect.height() - grip_size, grip_size, grip_size
+        )
+
     def fix_focus_policies(self):
         for btn in self.findChildren(QPushButton):
             btn.setFocusPolicy(Qt.NoFocus)
@@ -638,7 +739,19 @@ class ProSportsAnalyzer(QMainWindow):
     def mousePressEvent(self, event):
         self.setFocus()
         self.deselect_all()
+
+        if event.button() == Qt.LeftButton:
+            self.drag_pos = event.globalPos() - self.frameGeometry().topLeft()
+
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            if not self.isFullScreen():
+                if hasattr(self, "drag_pos"):
+                    self.move(event.globalPos() - self.drag_pos)
+                    event.accept()
+        super().mouseMoveEvent(event)
 
     def undo_action(self):
         if not self.history:
@@ -1128,6 +1241,14 @@ class ProSportsAnalyzer(QMainWindow):
             return super().keyPressEvent(event)
 
         raw_key = event.key()
+
+        if raw_key == Qt.Key_F11:
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
+            return
+
         k = self.normalize_key(raw_key)
 
         hk = self.settings.data["hotkeys"]
@@ -1193,6 +1314,185 @@ class ProSportsAnalyzer(QMainWindow):
             ]
         )
         return {"n": n, "k": k, "t": t, "fps": self.fps}
+
+
+class CustomTitleBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setFixedHeight(40)
+        self.setStyleSheet("background-color: #252526; border-bottom: 1px solid #333;")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.title_label = QLabel("Pro Sports Analyzer V1.4 [PORTABLE]")
+        self.title_label.setStyleSheet(
+            "color: #ccc; font-weight: bold; font-family: Segoe UI; font-size: 14px; border: none;"
+        )
+        layout.addWidget(self.title_label)
+        layout.addStretch()
+
+        btn_style = """
+            QPushButton {
+                background-color: transparent;
+                color: #ccc;
+                border: none;
+                font-size: 14px;
+                font-family: Segoe UI Symbol;
+            }
+            QPushButton:hover { background-color: #3e3e42; }
+            QPushButton:pressed { background-color: #007acc; color: white; }
+        """
+        btn_close_style = """
+            QPushButton {
+                background-color: transparent;
+                color: #ccc;
+                border: none;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #e81123; color: white; }
+            QPushButton:pressed { background-color: #f1707a; color: white; }
+        """
+
+        self.btn_min = QPushButton("—")
+        self.btn_min.setFixedSize(45, 40)
+        self.btn_min.setStyleSheet(btn_style)
+        self.btn_min.clicked.connect(self.minimize_window)
+        layout.addWidget(self.btn_min)
+
+        self.btn_max = QPushButton("☐")
+        self.btn_max.setFixedSize(45, 40)
+        self.btn_max.setStyleSheet(btn_style)
+        self.btn_max.clicked.connect(self.maximize_restore_window)
+        layout.addWidget(self.btn_max)
+
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setFixedSize(45, 40)
+        self.btn_close.setStyleSheet(btn_close_style)
+        self.btn_close.clicked.connect(self.close_window)
+        layout.addWidget(self.btn_close)
+
+    # Логика кнопок
+    def minimize_window(self):
+        self.parent_window.showMinimized()
+
+    def maximize_restore_window(self):
+        if self.parent_window.isMaximized():
+            self.parent_window.showNormal()
+            self.btn_max.setText("☐")
+        else:
+            self.parent_window.showMaximized()
+            self.btn_max.setText("❐")
+
+    def close_window(self):
+        self.parent_window.close()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.parent_window.moving = True
+            self.parent_window.offset = (
+                event.globalPos() - self.parent_window.frameGeometry().topLeft()
+            )
+
+    def mouseMoveEvent(self, event):
+        if self.parent_window.moving:
+            if not self.parent_window.isMaximized():
+                self.parent_window.move(event.globalPos() - self.parent_window.offset)
+
+    def mouseReleaseEvent(self, event):
+        self.parent_window
+
+
+# КЛАСС ДЛЯ ИЗМЕНЕНИЯ РАЗМЕРА ОКНА
+class SideGrip(QWidget):
+    def __init__(self, parent, edge):
+        super().__init__(parent)
+        self.edge = edge
+        self.parent_window = parent
+        self.setMouseTracking(True)
+
+        # Курсоры для разных сторон
+        if edge == Qt.LeftEdge:
+            self.setCursor(Qt.SizeHorCursor)
+        elif edge == Qt.RightEdge:
+            self.setCursor(Qt.SizeHorCursor)
+        elif edge == Qt.TopEdge:
+            self.setCursor(Qt.SizeVerCursor)
+        elif edge == Qt.BottomEdge:
+            self.setCursor(Qt.SizeVerCursor)
+        elif edge == "top_left":
+            self.setCursor(Qt.SizeFDiagCursor)
+        elif edge == "top_right":
+            self.setCursor(Qt.SizeBDiagCursor)
+        elif edge == "bottom_left":
+            self.setCursor(Qt.SizeBDiagCursor)
+        elif edge == "bottom_right":
+            self.setCursor(Qt.SizeFDiagCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.mousePos = event.globalPos()
+            self.windowPos = self.parent_window.pos()
+            self.windowSize = self.parent_window.size()
+            self.startGeometry = self.parent_window.geometry()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            delta = event.globalPos() - self.mousePos
+            geom = self.startGeometry
+
+            if self.edge == Qt.LeftEdge:
+                new_w = max(500, geom.width() - delta.x())
+                new_x = geom.x() + delta.x()
+                if new_w > 500:  # Мин. ширина
+                    self.parent_window.setGeometry(
+                        new_x, geom.y(), new_w, geom.height()
+                    )
+
+            elif self.edge == Qt.RightEdge:
+                new_w = max(500, geom.width() + delta.x())
+                self.parent_window.resize(new_w, geom.height())
+
+            elif self.edge == Qt.TopEdge:
+                new_h = max(300, geom.height() - delta.y())
+                new_y = geom.y() + delta.y()
+                if new_h > 300:  # Мин. высота
+                    self.parent_window.setGeometry(geom.x(), new_y, geom.width(), new_h)
+
+            elif self.edge == Qt.BottomEdge:
+                new_h = max(300, geom.height() + delta.y())
+                self.parent_window.resize(geom.width(), new_h)
+
+            # Углы (комбинация сторон)
+            elif self.edge == "bottom_right":
+                self.parent_window.resize(
+                    max(500, geom.width() + delta.x()),
+                    max(300, geom.height() + delta.y()),
+                )
+
+            elif self.edge == "bottom_left":
+                new_w = max(500, geom.width() - delta.x())
+                new_x = geom.x() + delta.x()
+                new_h = max(300, geom.height() + delta.y())
+                if new_w > 500:
+                    self.parent_window.setGeometry(new_x, geom.y(), new_w, new_h)
+
+            elif self.edge == "top_right":
+                new_w = max(500, geom.width() + delta.x())
+                new_h = max(300, geom.height() - delta.y())
+                new_y = geom.y() + delta.y()
+                if new_h > 300:
+                    self.parent_window.setGeometry(geom.x(), new_y, new_w, new_h)
+
+            elif self.edge == "top_left":
+                new_w = max(500, geom.width() - delta.x())
+                new_x = geom.x() + delta.x()
+                new_h = max(300, geom.height() - delta.y())
+                new_y = geom.y() + delta.y()
+                if new_w > 500 and new_h > 300:
+                    self.parent_window.setGeometry(new_x, new_y, new_w, new_h)
 
 
 if __name__ == "__main__":
