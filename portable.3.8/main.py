@@ -1,14 +1,28 @@
+# type: ignore
+
 import copy
 import ctypes
 import json
 import os
 import sys
-from ctypes import byref, c_int
+import time
+from ctypes import byref, c_int, sizeof
 
 import cv2
 from formulas import FormulasWindow
+
+# Импорт TimelineWidget
+try:
+    from timeline import TimelineWidget
+except ImportError:
+    from PySide2.QtWidgets import QWidget
+
+    class TimelineWidget(QWidget):
+        pass
+
+
 from PySide2 import __file__ as psf  # noqa
-from PySide2.QtCore import QMutex, QRect, Qt, QThread, Signal, Slot
+from PySide2.QtCore import QMutex, QRect, Qt, QThread, Signal, Slot, QPointF
 from PySide2.QtGui import (
     QBrush,
     QColor,
@@ -17,8 +31,8 @@ from PySide2.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
-    QPen,
     QPixmap,
+    QKeyEvent,
 )
 from PySide2.QtWidgets import (
     QApplication,
@@ -46,7 +60,6 @@ from PySide2.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from timeline import TimelineWidget
 
 is_exe_version = 0
 if "__compiled__" not in globals():
@@ -55,14 +68,12 @@ if "__compiled__" not in globals():
     dirname = os.path.dirname(PySide2.__file__)
     plugin_path = os.path.join(dirname, "plugins", "platforms")
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
-    print(f"Debug: Запуск скрипта. Путь к плагинам установлен вручную: {plugin_path}")
 else:
     is_exe_version = 1
 
 try:
-    # Set App ID for Taskbar
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-        "arseni.kuskou.prosportsanalyzer.1.5"
+        "arseni.kuskou.prosportsanalyzer.1.7"
     )
 except ImportError:
     pass
@@ -98,7 +109,8 @@ class SettingsManager:
             "mark": int(Qt.Key_M),
             "split": int(Qt.Key_S),
             "delete": int(Qt.Key_Delete),
-            "undo": int(Qt.Key_Z),
+            "undo": int(Qt.CTRL | Qt.Key_Z),
+            "redo": int(Qt.CTRL | Qt.Key_Y),
             "frame_prev": int(Qt.Key_Left),
             "frame_next": int(Qt.Key_Right),
             "seg_prev": int(Qt.Key_A),
@@ -153,7 +165,7 @@ class HotkeyEditor(QDialog):
     def __init__(self, parent, current_hotkeys):
         super().__init__(parent)
         self.setWindowTitle("Настройка горячих клавиш")
-        self.resize(500, 400)
+        self.resize(500, 450)
         self.hotkeys = current_hotkeys.copy()
         self.modified = False
 
@@ -162,7 +174,8 @@ class HotkeyEditor(QDialog):
             "mark": "Поставить метку",
             "split": "Разрезать",
             "delete": "Удалить",
-            "undo": "Отмена",
+            "undo": "Отмена (Undo)",
+            "redo": "Повтор (Redo)",
             "frame_prev": "Кадр назад",
             "frame_next": "Кадр вперед",
             "seg_prev": "Пред. отрезок",
@@ -190,7 +203,7 @@ class HotkeyEditor(QDialog):
         self.table.cellDoubleClicked.connect(self.capture_key)
         layout.addWidget(self.table)
 
-        layout.addWidget(QLabel("Дважды кликните по строке для изменения"))
+        layout.addWidget(QLabel("Дважды кликните по строке, затем нажмите комбинацию"))
 
         btn_box = QHBoxLayout()
         btn_save = QPushButton("Сохранить")
@@ -209,8 +222,8 @@ class HotkeyEditor(QDialog):
             self.table.insertRow(row)
             name = self.names.get(key_code_name, key_code_name)
             self.table.setItem(row, 0, QTableWidgetItem(name))
-            seq = QKeySequence(int(key_val)).toString()
-            item = QTableWidgetItem(seq)
+            seq_str = QKeySequence(int(key_val)).toString()
+            item = QTableWidgetItem(seq_str)
             item.setData(Qt.UserRole, key_code_name)
             self.table.setItem(row, 1, item)
 
@@ -219,17 +232,22 @@ class HotkeyEditor(QDialog):
         action_internal = self.table.item(row, 1).data(Qt.UserRole)
 
         d = QDialog(self)
-        d.setWindowTitle("Нажмите клавишу")
+        d.setWindowTitle("Ввод")
         d.resize(300, 150)
         ll = QVBoxLayout(d)
-        ll.addWidget(QLabel(f"Нажмите новую клавишу для:\n{key_name_item.text()}"))
+        ll.addWidget(QLabel(f"Нажмите комбинацию для:\n{key_name_item.text()}"))
 
         captured = []
 
         def key_press(e):
-            if e.key() not in [Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt]:
-                captured.append(e.key())
-                d.accept()
+            if e.key() in [Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta]:
+                return
+
+            modifiers = e.modifiers()
+            key = e.key()
+            full_code = int(modifiers | key)
+            captured.append(full_code)
+            d.accept()
 
         d.keyPressEvent = key_press
         if d.exec_() == QDialog.Accepted and captured:
@@ -238,48 +256,144 @@ class HotkeyEditor(QDialog):
             self.refresh_table()
 
 
-# --- SPLIT DIALOG ---
+# --- SPLIT DIALOG (FIXED EDGES + CLOSE BUTTON + NO SPACEBAR TRIGGER) ---
 class SplitDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Выбор разреза")
-        self.resize(300, 120)
-        self.choice = None  # 'left' or 'right'
+
+        # Прозрачность фона для скругленных углов
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+
+        self.resize(360, 230)
+        self.choice = None
 
         self.setStyleSheet("""
-            QDialog { background-color: #2b2b2b; color: #fff; }
-            QLabel { color: #fff; font-size: 14px; }
-            QPushButton { 
-                background-color: #444; color: #fff; border: 1px solid #666; padding: 10px; font-size: 13px;
+            QDialog {
+                background-color: transparent; 
             }
-            QPushButton:hover { background-color: #555; }
+            QFrame#MainFrame {
+                background-color: #252526;
+                border: 2px solid #0078d7;
+                border-radius: 12px;
+            }
+            QLabel { 
+                color: #ffffff; font-size: 16px; font-weight: bold; font-family: Segoe UI; border: none;
+            }
+            QLabel#Subtitle {
+                color: #bbbbbb; font-size: 13px; font-weight: normal; margin-bottom: 5px; border: none;
+            }
+            QPushButton { 
+                background-color: #333333; 
+                color: #eeeeee; 
+                border: 1px solid #555555; 
+                padding: 15px; 
+                font-size: 14px; 
+                border-radius: 6px;
+            }
+            QPushButton:hover { 
+                background-color: #3e3e42; 
+                border-color: #0078d7; 
+            }
+            QPushButton:pressed {
+                background-color: #0078d7;
+                color: #ffffff;
+            }
+            QPushButton#CloseBtn {
+                background-color: transparent;
+                border: none;
+                color: #aaaaaa;
+                font-size: 16px;
+                padding: 4px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton#CloseBtn:hover {
+                background-color: #c42b1c;
+                color: white;
+            }
+            QPushButton#CancelBtn {
+                background-color: transparent;
+                border: none;
+                color: #777777;
+                padding: 5px;
+                font-size: 12px;
+            }
+            QPushButton#CancelBtn:hover {
+                color: #aaaaaa;
+            }
         """)
 
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("К какому отрезку отнести ТЕКУЩИЙ кадр?"))
-        layout.addWidget(QLabel("(Клавиши: 1 - Влево, 2 - Вправо)"))
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.frame = QFrame()
+        self.frame.setObjectName("MainFrame")
+        main_layout.addWidget(self.frame)
+
+        layout = QVBoxLayout(self.frame)
+        layout.setContentsMargins(20, 10, 20, 15)
+
+        # Верхняя панель с крестиком
+        top_bar = QHBoxLayout()
+        top_bar.addStretch()
+
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setObjectName("CloseBtn")
+        self.btn_close.setFixedSize(30, 30)
+        self.btn_close.setFocusPolicy(Qt.NoFocus)  # Убираем фокус
+        self.btn_close.clicked.connect(self.reject)
+
+        top_bar.addWidget(self.btn_close)
+        layout.addLayout(top_bar)
+
+        lbl_title = QLabel("ВЫБОР ОТРЕЗКА")
+        lbl_title.setAlignment(Qt.AlignCenter)
+        lbl_title.setStyleSheet("margin-top: -10px; margin-bottom: 5px;")
+        layout.addWidget(lbl_title)
+
+        lbl_sub = QLabel("К какому отрезку отнести ТЕКУЩИЙ кадр?")
+        lbl_sub.setObjectName("Subtitle")
+        lbl_sub.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl_sub)
 
         btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(15)
 
-        btn_left = QPushButton("<- К левому (1)")
-        btn_left.clicked.connect(lambda: self.set_choice("left"))
+        self.btn_left = QPushButton("← Влево\n(1 или A)")
+        # Убираем фокус, чтобы Spacebar не нажимал кнопку
+        self.btn_left.setFocusPolicy(Qt.NoFocus)
+        self.btn_left.clicked.connect(lambda: self.set_choice("left"))
 
-        btn_right = QPushButton("К правому -> (2)")
-        btn_right.clicked.connect(lambda: self.set_choice("right"))
+        self.btn_right = QPushButton("Вправо →\n(2 или D)")
+        # Убираем фокус, чтобы Spacebar не нажимал кнопку
+        self.btn_right.setFocusPolicy(Qt.NoFocus)
+        self.btn_right.clicked.connect(lambda: self.set_choice("right"))
 
-        btn_layout.addWidget(btn_left)
-        btn_layout.addWidget(btn_right)
+        btn_layout.addWidget(self.btn_left)
+        btn_layout.addWidget(self.btn_right)
         layout.addLayout(btn_layout)
+
+        layout.addStretch()
+
+        btn_cancel = QPushButton("Отмена (Esc)")
+        btn_cancel.setObjectName("CancelBtn")
+        btn_cancel.setFocusPolicy(Qt.NoFocus)  # Убираем фокус
+        btn_cancel.clicked.connect(self.reject)
+        layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
 
     def set_choice(self, val):
         self.choice = val
         self.accept()
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key_1:
+        k = event.key()
+        if k == Qt.Key_1 or k == Qt.Key_A or k == 1060:
             self.set_choice("left")
-        elif event.key() == Qt.Key_2:
+        elif k == Qt.Key_2 or k == Qt.Key_D or k == 1042:
             self.set_choice("right")
+        elif k == Qt.Key_Escape:
+            self.reject()
         else:
             super().keyPressEvent(event)
 
@@ -313,7 +427,7 @@ class VideoThread(QThread):
                     "height": int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                     "total": int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)),
                 }
-                self.fps = info["fps"]
+                self.fps = info["fps"] if info["fps"] > 0 else 30
                 self.current_frame_num = 0
                 self.video_info_signal.emit(info)
         finally:
@@ -350,9 +464,13 @@ class VideoThread(QThread):
     def run(self):
         self._run_flag = True
         while self._run_flag:
+            start_time = time.time()
             self.mutex.lock()
+            frame_ready = False
+            frame = None
             try:
                 if not self._run_flag:
+                    self.mutex.unlock()
                     break
                 if self.cap and self.cap.isOpened():
                     ret, frame = self.cap.read()
@@ -360,17 +478,26 @@ class VideoThread(QThread):
                         self.current_frame_num = (
                             int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
                         )
-                        self.change_pixmap_signal.emit(frame)
+                        frame_ready = True
                     else:
                         self.finished_signal.emit()
                         self._run_flag = False
                 else:
-                    break
+                    self._run_flag = False
             finally:
                 self.mutex.unlock()
 
+            if frame_ready and frame is not None:
+                self.change_pixmap_signal.emit(frame)
+
             if self._run_flag and self.fps > 0:
-                self.msleep(int(1000.0 / (self.fps * self.speed)))
+                processing_time = time.time() - start_time
+                target_delay = 1.0 / (self.fps * self.speed)
+                sleep_time = target_delay - processing_time
+                if sleep_time > 0:
+                    self.msleep(int(sleep_time * 1000))
+                else:
+                    self.msleep(1)
 
     def stop(self):
         self._run_flag = False
@@ -385,15 +512,16 @@ class ProSportsAnalyzer(QMainWindow):
         super().__init__()
         self.settings = SettingsManager()
 
-        self.setWindowTitle(f"Pro Sports Analyzer v1.5.{is_exe_version}")
+        self.setWindowTitle(f"Pro Sports Analyzer v1.6.{is_exe_version}")
         self.resize(1600, 950)
         self.setAcceptDrops(True)
 
+        # --- DARK TITLE BAR FOR WINDOWS ---
         try:
             hwnd = self.winId()
             value = c_int(1)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                int(hwnd), 20, byref(value), ctypes.sizeof(value)
+                int(hwnd), 20, byref(value), sizeof(value)
             )
         except Exception:
             pass
@@ -401,90 +529,23 @@ class ProSportsAnalyzer(QMainWindow):
         self.setStyleSheet("""
             QMainWindow { background-color: #1e1e1e; color: #f0f0f0; font-family: Segoe UI; }
             QWidget { font-size: 14px; }
-            
             QMessageBox { background-color: #2b2b2b; color: #f0f0f0; }
-            QMessageBox QLabel { color: #f0f0f0; }
-            QMessageBox QPushButton {
-                background-color: #3a3a3a; color: #fff; border: 1px solid #555;
-                padding: 6px 15px; border-radius: 3px; min-width: 60px;
-            }
-            QMessageBox QPushButton:hover { background-color: #4a4a4a; }
-            
-            QGroupBox { 
-                border: 1px solid #444; margin-top: 20px; font-weight: bold; 
-                color: #ccc; background-color: #2b2b2b; border-radius: 3px; padding-top: 15px;
-            }
+            QGroupBox { border: 1px solid #444; margin-top: 20px; font-weight: bold; background-color: #2b2b2b; border-radius: 3px; padding-top: 15px; color: #ccc;}
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; left: 10px; color: #fff; }
-            
-            QPushButton { 
-                background-color: #3a3a3a; border: 1px solid #555; padding: 6px 12px; 
-                color: white; border-radius: 2px; 
-            }
+            QPushButton { background-color: #3a3a3a; border: 1px solid #555; padding: 6px 12px; color: white; border-radius: 2px; }
             QPushButton:hover { background-color: #505050; border-color: #777; }
             QPushButton:pressed { background-color: #0078d7; border-color: #0078d7; }
             QPushButton:disabled { background-color: #2a2a2a; color: #555; border-color: #333; }
-            
             QLineEdit { background-color: #1e1e1e; color: #fff; padding: 4px; border: 1px solid #555; }
             QLineEdit:focus { border: 1px solid #0078d7; }
-            
             QLabel { color: #e0e0e0; }
-            
             QListWidget { background-color: #222; border: 1px solid #444; color: #ffffff; outline: none; }
-            QListWidget::item { color: #ffffff; padding: 4px; }
             QListWidget::item:hover { background-color: #2a2a2a; }
             QListWidget::item:selected { background-color: #222; color: #ffffff; }
-            
-            QCheckBox { color: #ffffff; spacing: 5px; }
-            QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid #666; background: #333; }
-            QCheckBox::indicator:checked { background: #0078d7; border-color: #0078d7; }
-
-            QDoubleSpinBox { 
-                background-color: #222; color: #fff; border: 1px solid #555; padding: 4px; 
-                selection-background-color: #222; 
-                selection-color: #fff;
-            }
-            QDoubleSpinBox:focus { border: 1px solid #0078d7; }
-
-            /* SCROLLBAR / SLIDER STYLE */
-            QSlider::groove:horizontal {
-                border: 1px solid #444;
-                height: 8px;
-                background: #333;
-                margin: 2px 0;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #0078d7;
-                border: 1px solid #0078d7;
-                width: 18px;
-                height: 18px;
-                margin: -6px 0;
-                border-radius: 9px;
-            }
-            QSlider::handle:horizontal:hover {
-                background: #1e8feb;
-            }
-            QSlider::sub-page:horizontal:disabled {
-                background: #333;
-            }
-            
-            QScrollBar:horizontal {
-                border: 1px solid #333;
-                background: #222;
-                height: 15px;
-                margin: 0px 20px 0 20px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #555;
-                min-width: 20px;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                background: none;
-                width: 0px;
-            }
+            QSlider::groove:horizontal { border: 1px solid #444; height: 8px; background: #333; margin: 2px 0; border-radius: 4px; }
+            QSlider::handle:horizontal { background: #0078d7; border: 1px solid #0078d7; width: 18px; height: 18px; margin: -6px 0; border-radius: 9px; }
         """)
 
-        # Data
         self.total_frames = 100
         self.fps = 30.0
         self.current_frame = 0
@@ -495,10 +556,18 @@ class ProSportsAnalyzer(QMainWindow):
 
         self.segments = []
         self.markers = []
+
         self.history = []
+        self.redo_stack = []
         self.is_undoing = False
+
         self.is_merge_mode = False
         self.merge_buffer = []
+
+        self.video_zoom = 1.0
+        self.video_pan = QPointF(0, 0)
+        self.dragging_video = False
+        self.last_mouse_pos = QPointF()
 
         self.current_marker_color = "#ff0000"
         self.current_marker_tag = "Main"
@@ -543,26 +612,16 @@ class ProSportsAnalyzer(QMainWindow):
         l_file.addWidget(btn_hotkeys)
 
         l_info_grid = QVBoxLayout()
-        l_info_grid.setSpacing(2)
         self.lbl_vid_res = QLabel("Разрешение: -")
         self.lbl_vid_fps = QLabel("FPS: -")
-        self.lbl_vid_frames = QLabel("Всего кадров: -")
-        self.lbl_vid_ext = QLabel("Формат: -")
-        for lbl in [
-            self.lbl_vid_res,
-            self.lbl_vid_fps,
-            self.lbl_vid_frames,
-            self.lbl_vid_ext,
-        ]:
-            lbl.setStyleSheet("color: #aaa; font-size: 12px;")
-            l_info_grid.addWidget(lbl)
+        l_info_grid.addWidget(self.lbl_vid_res)
+        l_info_grid.addWidget(self.lbl_vid_fps)
         l_file.addLayout(l_info_grid)
         gb_file.setLayout(l_file)
         left_layout.addWidget(gb_file)
 
         gb_markers = QGroupBox("Метки")
         l_markers = QVBoxLayout()
-
         self.btn_mark = QPushButton("🚩 ПОСТАВИТЬ МЕТКУ")
         self.btn_mark.setMinimumHeight(40)
         self.btn_mark.setStyleSheet(
@@ -572,64 +631,56 @@ class ProSportsAnalyzer(QMainWindow):
         l_markers.addWidget(self.btn_mark)
 
         self.lbl_marker_mode = QLabel("Режим: Создание")
-        self.lbl_marker_mode.setStyleSheet(
-            "color: #888; font-style: italic; margin-top: 5px;"
-        )
         l_markers.addWidget(self.lbl_marker_mode)
 
         h_m1 = QHBoxLayout()
         self.btn_color = QPushButton("")
         self.btn_color.setFixedSize(24, 24)
-        self.btn_color.setStyleSheet(
-            f"background-color: {self.current_marker_color}; border: 1px solid #fff; border-radius: 12px;"
-        )
         self.btn_color.clicked.connect(self.pick_color)
-
         self.inp_tag = QLineEdit("Main")
-        self.inp_tag.setPlaceholderText("Тег")
         self.inp_tag.returnPressed.connect(self.setFocus)
         self.inp_tag.textChanged.connect(self.update_marker_props_live)
-
         h_m1.addWidget(QLabel("Цвет:"))
         h_m1.addWidget(self.btn_color)
         h_m1.addWidget(self.inp_tag)
         l_markers.addLayout(h_m1)
 
-        l_markers.addWidget(QLabel("Список меток (фильтр):"))
+        l_markers.addWidget(QLabel("Список меток:"))
         self.list_filters = QListWidget()
-        self.list_filters.setMinimumHeight(150)
-        self.list_filters.setSelectionMode(QListWidget.NoSelection)
         self.list_filters.itemChanged.connect(self.on_filter_changed)
         self.list_filters.setFocusPolicy(Qt.NoFocus)
         l_markers.addWidget(self.list_filters)
-
         gb_markers.setLayout(l_markers)
         left_layout.addWidget(gb_markers)
 
         gb_actions = QGroupBox("Действия")
         l_actions = QVBoxLayout()
+
+        h_undo_redo = QHBoxLayout()
         self.btn_undo = QPushButton("↶ Отмена")
         self.btn_undo.clicked.connect(self.undo_action)
+        self.btn_redo = QPushButton("↷ Повтор")
+        self.btn_redo.clicked.connect(self.redo_action)
+        h_undo_redo.addWidget(self.btn_undo)
+        h_undo_redo.addWidget(self.btn_redo)
+        l_actions.addLayout(h_undo_redo)
+
         self.btn_split = QPushButton("✂ Разрезать")
         self.btn_split.clicked.connect(self.split_segment)
         self.btn_merge = QPushButton("🔗 Объединить")
         self.btn_merge.clicked.connect(self.start_merge_mode)
-
         self.btn_cancel_merge = QPushButton("❌ Отмена объед.")
         self.btn_cancel_merge.clicked.connect(self.stop_merge_mode)
         self.btn_cancel_merge.hide()
-
         self.btn_delete = QPushButton("🗑 Удалить")
         self.btn_delete.clicked.connect(self.delete_selection)
 
-        l_actions.addWidget(self.btn_undo)
         l_actions.addWidget(self.btn_split)
         l_actions.addWidget(self.btn_merge)
         l_actions.addWidget(self.btn_cancel_merge)
         l_actions.addWidget(self.btn_delete)
         gb_actions.setLayout(l_actions)
         left_layout.addWidget(gb_actions)
-
         left_layout.addStretch()
         top_layout.addWidget(left_panel)
 
@@ -639,8 +690,11 @@ class ProSportsAnalyzer(QMainWindow):
         self.video_container.setStyleSheet(
             "background-color: black; border: 1px solid #333;"
         )
-        # FORCE FOCUS ON VIDEO CLICK
-        self.video_container.mousePressEvent = self.on_video_container_click
+        self.video_container.setMouseTracking(True)
+        self.video_container.wheelEvent = self.video_wheel_event
+        self.video_container.mousePressEvent = self.video_mouse_press
+        self.video_container.mouseMoveEvent = self.video_mouse_move
+        self.video_container.mouseReleaseEvent = self.video_mouse_release
 
         self.stack_layout = QStackedLayout(self.video_container)
         self.stack_layout.setStackingMode(QStackedLayout.StackAll)
@@ -661,71 +715,45 @@ class ProSportsAnalyzer(QMainWindow):
 
         top_layout.addWidget(self.video_container, stretch=1)
 
-        # RIGHT PANEL
+        # RIGHT PANEL (ANALYSIS)
         right_panel = QWidget()
         right_panel.setFixedWidth(300)
         right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setAlignment(Qt.AlignTop)
 
         gb_calc = QGroupBox("Анализ")
         gb_calc.setStyleSheet("QGroupBox { border: 1px solid #0078d7; }")
         l_calc = QVBoxLayout()
-
         self.lbl_global_frame = QLabel("Кадр: 0")
         self.lbl_global_time = QLabel("Время: 0.00s")
-        self.lbl_global_duration = QLabel("Длительность: 0.00s")
-        self.lbl_total_marks = QLabel("Всего меток: 0")
-
-        font_head = QFont("Segoe UI", 11, QFont.Bold)
-        font_data = QFont("Segoe UI", 10)
-
-        for ll in [
-            self.lbl_global_frame,
-            self.lbl_global_time,
-            self.lbl_global_duration,
-            self.lbl_total_marks,
-        ]:
-            ll.setFont(font_data)
-            l_calc.addWidget(ll)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color: #444;")
-        l_calc.addWidget(sep)
 
         self.lbl_info_seg = QLabel("Нет выбора")
-        self.lbl_info_seg.setFont(font_head)
-        self.lbl_info_seg.setStyleSheet("color: #fff; margin-top: 5px;")
-        l_calc.addWidget(self.lbl_info_seg)
+        self.lbl_info_seg.setStyleSheet(
+            "color: #fff; font-weight: bold; font-size: 16px; margin-top: 5px;"
+        )
 
         self.lbl_rel_frame = QLabel("Кадр (отр): -")
-        self.lbl_rel_frame.setFont(font_data)
-        l_calc.addWidget(self.lbl_rel_frame)
-
         self.lbl_rel_time = QLabel("Время (отр): -")
-        self.lbl_rel_time.setFont(font_data)
         self.lbl_rel_time.setStyleSheet("color: #00ffff; font-weight: bold;")
-        l_calc.addWidget(self.lbl_rel_time)
 
         self.lbl_seg_total_frames = QLabel("Кадров (всего): -")
-        self.lbl_seg_total_frames.setFont(font_data)
-        l_calc.addWidget(self.lbl_seg_total_frames)
-
         self.lbl_seg_duration = QLabel("Длит. (всего): -")
-        self.lbl_seg_duration.setFont(font_data)
-        l_calc.addWidget(self.lbl_seg_duration)
-
         self.lbl_seg_marks = QLabel("Метки (отр): -")
-        self.lbl_seg_marks.setFont(font_data)
-        l_calc.addWidget(self.lbl_seg_marks)
 
         self.lbl_tempo = QLabel("SPM: 0.0")
         self.lbl_tempo.setStyleSheet(
-            "color: #00ff00; font-size: 22px; font-weight: bold; margin-top: 10px; background: #222; padding: 5px; border-radius: 4px; border: 1px solid #005500;"
+            "color: #00ff00; font-size: 22px; font-weight: bold; background: #222; padding: 5px; border-radius: 4px; margin-top: 5px;"
         )
-        l_calc.addWidget(self.lbl_tempo)
 
+        l_calc.addWidget(self.lbl_global_frame)
+        l_calc.addWidget(self.lbl_global_time)
+        l_calc.addWidget(self.lbl_info_seg)
+        l_calc.addWidget(self.lbl_rel_frame)
+        l_calc.addWidget(self.lbl_rel_time)
+        l_calc.addWidget(self.lbl_seg_total_frames)
+        l_calc.addWidget(self.lbl_seg_duration)
+        l_calc.addWidget(self.lbl_seg_marks)
+        l_calc.addWidget(self.lbl_tempo)
         gb_calc.setLayout(l_calc)
         right_layout.addWidget(gb_calc)
 
@@ -736,12 +764,12 @@ class ProSportsAnalyzer(QMainWindow):
         )
         right_layout.addWidget(btn_formulas)
 
-        gb_speed = QGroupBox("Скорость воспроизведения")
+        gb_speed = QGroupBox("Скорость")
         h_speed = QHBoxLayout()
         self.spin_speed = QDoubleSpinBox()
         self.spin_speed.setRange(0.1, 5.0)
-        self.spin_speed.setSingleStep(0.1)
         self.spin_speed.setValue(1.0)
+        self.spin_speed.setSingleStep(0.1)
         self.spin_speed.valueChanged.connect(self.change_speed)
         self.spin_speed.setFocusPolicy(Qt.ClickFocus)
         h_speed.addWidget(self.spin_speed)
@@ -752,71 +780,75 @@ class ProSportsAnalyzer(QMainWindow):
         top_layout.addWidget(right_panel)
         main_layout.addLayout(top_layout)
 
-        # --- SLIDER (SCRUBBER) ---
+        # --- SLIDER & TIMELINE ---
         self.scrubber = QSlider(Qt.Horizontal)
         self.scrubber.setRange(0, 100)
-        self.scrubber.setEnabled(False)  # Disable initially
-        self.scrubber.setFocusPolicy(Qt.NoFocus)
+        self.scrubber.setEnabled(False)
         self.scrubber.valueChanged.connect(self.on_scrubber_change)
         main_layout.addWidget(self.scrubber)
 
-        # --- SPACER ---
-        main_layout.addSpacing(15)
-
-        # --- TIMELINE ---
         self.timeline = TimelineWidget()
         self.timeline.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.timeline.seek_requested.connect(self.seek_video)
         self.timeline.segment_selected.connect(self.on_timeline_click)
         self.timeline.marker_selected.connect(self.on_selection_changed)
-        # Connect zoom signal to update scrollbar
         self.timeline.view_changed.connect(self.update_timeline_scrollbar)
         main_layout.addWidget(self.timeline)
 
-        # --- TIMELINE SCROLLBAR ---
         self.timeline_scroll = QScrollBar(Qt.Horizontal)
-        self.timeline_scroll.setRange(0, 0)
         self.timeline_scroll.setEnabled(False)
-        self.timeline_scroll.setFocusPolicy(Qt.NoFocus)
         self.timeline_scroll.valueChanged.connect(self.on_timeline_scroll)
         main_layout.addWidget(self.timeline_scroll)
 
         self.fix_focus_policies()
+        self.update_ui_marker_controls()
 
     def fix_focus_policies(self):
         for btn in self.findChildren(QPushButton):
             btn.setFocusPolicy(Qt.NoFocus)
+        self.scrubber.setFocusPolicy(Qt.NoFocus)
+        self.timeline_scroll.setFocusPolicy(Qt.NoFocus)
         self.setFocus()
 
-    def on_video_container_click(self, event):
-        # Force focus back to main window when video area is clicked
+    # --- VIDEO ZOOM & PAN ---
+    def video_wheel_event(self, event):
+        angle = event.angleDelta().y()
+        if angle > 0:
+            self.video_zoom *= 1.1
+        else:
+            self.video_zoom /= 1.1
+
+        if self.video_zoom < 1.0:
+            self.video_zoom = 1.0
+            self.video_pan = QPointF(0, 0)
+
+        self.redraw_current_frame()
+
+    def video_mouse_press(self, event):
+        if event.button() == Qt.LeftButton and self.video_zoom > 1.0:
+            self.dragging_video = True
+            self.last_mouse_pos = event.pos()
+            self.video_container.setCursor(Qt.ClosedHandCursor)
         self.setFocus()
-        if hasattr(QWidget, "mousePressEvent"):
-            # Call base implementation if needed, though QWidget doesn't do much
-            pass
+
+    def video_mouse_move(self, event):
+        if self.dragging_video:
+            delta = event.pos() - self.last_mouse_pos
+            self.last_mouse_pos = event.pos()
+            self.video_pan += QPointF(delta.x(), delta.y())
+            self.redraw_current_frame()
+
+    def video_mouse_release(self, event):
+        self.dragging_video = False
+        self.video_container.setCursor(Qt.ArrowCursor)
 
     def on_scrubber_change(self, val):
-        # FIX: Check if video is actually loaded to prevent crash
-        if (
-            not hasattr(self, "thread")
-            or not self.thread.cap
-            or not self.thread.cap.isOpened()
-        ):
-            return
-
-        try:
-            # Only seek if the difference is significant or user is dragging
-            # Check signalsBlocked to avoid seeking when we update slider programmatically
+        if hasattr(self, "thread") and self.thread.cap and self.thread.cap.isOpened():
             if self.scrubber.isEnabled() and not self.scrubber.signalsBlocked():
                 self.seek_video(val)
-        except Exception:
-            pass  # Avoid crashes during init
-
-        # ALWAYS reset focus to Main Window so Hotkeys work after dragging
         self.setFocus()
 
     def update_timeline_scrollbar(self, start, length, total):
-        # Logic to update scrollbar based on timeline zoom
         if length >= total or total == 0:
             self.timeline_scroll.setEnabled(False)
             self.timeline_scroll.setRange(0, 0)
@@ -848,14 +880,16 @@ class ProSportsAnalyzer(QMainWindow):
         self.settings.save()
         super().closeEvent(event)
 
-    def mousePressEvent(self, event):
-        self.setFocus()
-        self.deselect_all()
-        super().mousePressEvent(event)
-
+    # --- UNDO / REDO ---
     def undo_action(self):
         if not self.history:
             return
+        current_state = {
+            "segments": copy.deepcopy(self.segments),
+            "markers": copy.deepcopy(self.markers),
+        }
+        self.redo_stack.append(current_state)
+
         self.is_undoing = True
         state = self.history.pop()
         self.segments = state["segments"]
@@ -866,9 +900,37 @@ class ProSportsAnalyzer(QMainWindow):
         self.redraw_current_frame()
         self.is_undoing = False
 
+        self.btn_redo.setEnabled(True)
+        self.btn_undo.setEnabled(len(self.history) > 0)
+
+    def redo_action(self):
+        if not self.redo_stack:
+            return
+        current_state = {
+            "segments": copy.deepcopy(self.segments),
+            "markers": copy.deepcopy(self.markers),
+        }
+        self.history.append(current_state)
+
+        self.is_undoing = True
+        state = self.redo_stack.pop()
+        self.segments = state["segments"]
+        self.markers = state["markers"]
+        self.timeline.set_data(self.total_frames, self.fps, self.segments, self.markers)
+        self.update_filter_list()
+        self.calculate_stats()
+        self.redraw_current_frame()
+        self.is_undoing = False
+
+        self.btn_redo.setEnabled(len(self.redo_stack) > 0)
+        self.btn_undo.setEnabled(True)
+
     def save_state(self):
         if self.is_undoing:
             return
+        self.redo_stack.clear()
+        self.btn_redo.setEnabled(False)
+
         state = {
             "segments": copy.deepcopy(self.segments),
             "markers": copy.deepcopy(self.markers),
@@ -876,7 +938,9 @@ class ProSportsAnalyzer(QMainWindow):
         self.history.append(state)
         if len(self.history) > 1000:
             self.history.pop(0)
+        self.btn_undo.setEnabled(True)
 
+    # --- MARKERS ---
     def pick_color(self):
         init = self.current_marker_color
         idx = self.timeline.selected_marker_idx
@@ -914,9 +978,7 @@ class ProSportsAnalyzer(QMainWindow):
         if idx != -1 and idx < len(self.markers):
             m = self.markers[idx]
             self.lbl_marker_mode.setText("Режим: ИЗМЕНЕНИЕ")
-            self.lbl_marker_mode.setStyleSheet(
-                "color: #0f0; font-weight: bold; margin-top: 5px;"
-            )
+            self.lbl_marker_mode.setStyleSheet("color: #0f0; font-weight: bold;")
             self.inp_tag.blockSignals(True)
             self.inp_tag.setText(m["tag"])
             self.inp_tag.blockSignals(False)
@@ -925,9 +987,7 @@ class ProSportsAnalyzer(QMainWindow):
             )
         else:
             self.lbl_marker_mode.setText("Режим: СОЗДАНИЕ")
-            self.lbl_marker_mode.setStyleSheet(
-                "color: #888; font-style: italic; margin-top: 5px;"
-            )
+            self.lbl_marker_mode.setStyleSheet("color: #888; font-style: italic;")
             self.inp_tag.blockSignals(True)
             self.inp_tag.setText(self.current_marker_tag)
             self.inp_tag.blockSignals(False)
@@ -976,24 +1036,27 @@ class ProSportsAnalyzer(QMainWindow):
         self.setFocus()
 
     def reset_session_data(self):
-        # Stop thread
         self.playing = False
         if hasattr(self, "thread"):
             self.thread.stop()
-            self.thread.wait()  # Ensure stopped
+            self.thread.wait()
 
-        # Clear data
         self.segments = []
         self.markers = []
         self.history = []
+        self.redo_stack = []
+        self.btn_undo.setEnabled(False)
+        self.btn_redo.setEnabled(False)
+
         self.merge_buffer = []
         self.is_merge_mode = False
         self.current_frame = 0
         self.total_frames = 0
         self.fps = 30.0
         self.last_frame = None
+        self.video_zoom = 1.0
+        self.video_pan = QPointF(0, 0)
 
-        # Reset UI
         self.scrubber.setEnabled(False)
         self.scrubber.setValue(0)
         self.timeline.set_data(0, 30, [], [])
@@ -1004,22 +1067,11 @@ class ProSportsAnalyzer(QMainWindow):
         self.btn_split.setEnabled(True)
         self.btn_delete.setEnabled(True)
         self.list_filters.clear()
-
-        # Reset scrollbar
         self.timeline_scroll.setEnabled(False)
-        self.timeline_scroll.setRange(0, 0)
-
-        # Reset Labels
-        self.lbl_vid_res.setText("Разрешение: -")
-        self.lbl_vid_fps.setText("FPS: -")
-        self.lbl_vid_frames.setText("Всего кадров: -")
-        self.lbl_vid_ext.setText("Формат: -")
-
         self.calculate_stats()
 
     def load_video(self, path):
-        self.reset_session_data()  # Reset everything before loading new
-
+        self.reset_session_data()
         self.save_state()
         self.current_ext = os.path.splitext(path)[1]
         self.thread.load_video(path)
@@ -1030,7 +1082,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.segments = [{"start": 0, "end": self.total_frames}]
         self.markers = []
 
-        # Update Scrubber Range and Enable
         self.scrubber.setRange(0, self.total_frames - 1)
         self.scrubber.setValue(0)
         self.scrubber.setEnabled(True)
@@ -1040,8 +1091,6 @@ class ProSportsAnalyzer(QMainWindow):
 
         self.lbl_vid_res.setText(f"Разрешение: {info['width']}x{info['height']}")
         self.lbl_vid_fps.setText(f"FPS: {self.fps:.2f}")
-        self.lbl_vid_frames.setText(f"Всего кадров: {self.total_frames}")
-        self.lbl_vid_ext.setText(f"Формат: {self.current_ext}")
 
         self.calculate_stats()
         self.setFocus()
@@ -1057,11 +1106,55 @@ class ProSportsAnalyzer(QMainWindow):
             self.draw_frame(self.last_frame)
 
     def draw_frame(self, frame):
-        h, w, ch = frame.shape
+        h_orig, w_orig, ch = frame.shape
         lbl_w = self.video_label.width()
         lbl_h = self.video_label.height()
-        if lbl_w > 0 and lbl_h > 0:
-            aspect = w / h
+
+        if lbl_w <= 0 or lbl_h <= 0:
+            return
+
+        if self.video_zoom > 1.0:
+            visible_w = w_orig / self.video_zoom
+            visible_h = h_orig / self.video_zoom
+
+            cx = w_orig / 2.0 - self.video_pan.x()
+            cy = h_orig / 2.0 - self.video_pan.y()
+
+            x1 = cx - visible_w / 2.0
+            y1 = cy - visible_h / 2.0
+            x2 = x1 + visible_w
+            y2 = y1 + visible_h
+
+            if x1 < 0:
+                x1 = 0
+            if y1 < 0:
+                y1 = 0
+            if x2 > w_orig:
+                x1 = w_orig - visible_w
+            if y2 > h_orig:
+                y1 = h_orig - visible_h
+
+            x1, y1 = int(max(0, x1)), int(max(0, y1))
+            x2, y2 = int(min(w_orig, x2)), int(min(h_orig, y2))
+
+            if x2 - x1 < 10 or y2 - y1 < 10:
+                cropped = frame
+            else:
+                cropped = frame[y1:y2, x1:x2]
+
+            aspect = (x2 - x1) / (y2 - y1) if (y2 - y1) > 0 else 1
+            target_w = lbl_w
+            target_h = int(target_w / aspect)
+            if target_h > lbl_h:
+                target_h = lbl_h
+                target_w = int(target_h * aspect)
+
+            frame_resized = cv2.resize(
+                cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+            )
+
+        else:
+            aspect = w_orig / h_orig
             target_w = lbl_w
             target_h = int(target_w / aspect)
             if target_h > lbl_h:
@@ -1070,8 +1163,6 @@ class ProSportsAnalyzer(QMainWindow):
             frame_resized = cv2.resize(
                 frame, (target_w, target_h), interpolation=cv2.INTER_AREA
             )
-        else:
-            frame_resized = frame
 
         rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         qimg = QImage(
@@ -1086,7 +1177,6 @@ class ProSportsAnalyzer(QMainWindow):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        # 1. MARKER
         for m in self.markers:
             if m.get("visible", True) and m["frame"] == self.current_frame:
                 tag_text = f"🚩 {m.get('tag', 'Mark')}"
@@ -1095,48 +1185,28 @@ class ProSportsAnalyzer(QMainWindow):
                 metrics = painter.fontMetrics()
                 text_w = metrics.horizontalAdvance(tag_text)
                 text_h = metrics.height()
-
                 pad = 10
-                box_w = text_w + pad * 2
-                box_h = text_h + pad
-                box_x = pixmap.width() - box_w - 20
+                box_x = pixmap.width() - (text_w + pad * 2) - 20
                 box_y = 20
-
-                bg_color = QColor(m["color"])
-                bg_color.setAlpha(220)
-                painter.setBrush(QBrush(bg_color))
-                painter.setPen(Qt.NoPen)
-                painter.drawRoundedRect(box_x, box_y, box_w, box_h, 5, 5)
-
-                painter.setPen(QPen(Qt.white))
+                painter.setBrush(QBrush(QColor(m["color"])))
+                painter.drawRoundedRect(
+                    box_x, box_y, text_w + pad * 2, text_h + pad, 5, 5
+                )
+                painter.setPen(Qt.white)
                 painter.drawText(
-                    QRect(box_x, box_y, box_w, box_h), Qt.AlignCenter, tag_text
+                    QRect(box_x, box_y, text_w + pad * 2, text_h + pad),
+                    Qt.AlignCenter,
+                    tag_text,
                 )
                 break
 
-        # 2. PAUSE INDICATOR
         if not self.playing and not self.is_merge_mode:
-            pause_text = "⏸ ПАУЗА"
-            font_p = QFont("Segoe UI", 16, QFont.Bold)
-            painter.setFont(font_p)
-            metrics_p = painter.fontMetrics()
-            pw = metrics_p.horizontalAdvance(pause_text)
-            ph = metrics_p.height()
+            self.draw_overlay_text(painter, "⏸ ПАУЗА", 20, 20)
 
-            p_pad = 10
-            p_box_w = pw + p_pad * 3
-            p_box_h = ph + p_pad
-            p_box_x = 20
-            p_box_y = 20
-
-            p_bg = QColor(0, 0, 0, 150)
-            painter.setBrush(QBrush(p_bg))
-            painter.setPen(QPen(QColor(255, 255, 255, 100), 2))
-            painter.drawRoundedRect(p_box_x, p_box_y, p_box_w, p_box_h, 5, 5)
-
-            painter.setPen(QPen(Qt.white))
-            painter.drawText(
-                QRect(p_box_x, p_box_y, p_box_w, p_box_h), Qt.AlignCenter, pause_text
+        if self.video_zoom > 1.05:
+            z_txt = f"ZOOM: {self.video_zoom:.1f}x"
+            self.draw_overlay_text(
+                painter, z_txt, 20, pixmap.height() - 50, bg_alpha=100
             )
 
         painter.end()
@@ -1145,11 +1215,22 @@ class ProSportsAnalyzer(QMainWindow):
         self.timeline.set_current_frame(self.current_frame)
         self.calculate_stats()
 
+    def draw_overlay_text(self, painter, text, x, y, bg_alpha=150):
+        font = QFont("Segoe UI", 16, QFont.Bold)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        w = metrics.horizontalAdvance(text) + 20
+        h = metrics.height() + 10
+        painter.setBrush(QBrush(QColor(0, 0, 0, bg_alpha)))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(x, y, w, h, 5, 5)
+        painter.setPen(Qt.white)
+        painter.drawText(QRect(x, y, w, h), Qt.AlignCenter, text)
+
     def add_mark(self):
         for m in self.markers:
             if m["frame"] == self.current_frame:
                 return
-
         self.save_state()
         new_marker = {
             "frame": self.current_frame,
@@ -1165,17 +1246,19 @@ class ProSportsAnalyzer(QMainWindow):
         self.redraw_current_frame()
 
     def split_segment(self):
+        if self.playing:
+            self.playing = False
+            self.thread.stop()
+            self.redraw_current_frame()
         if self.is_merge_mode:
             return
         idx = -1
-        # Find which segment contains the current frame
         for i, seg in enumerate(self.segments):
             if seg["start"] <= self.current_frame < seg["end"]:
                 idx = i
                 break
 
         if idx != -1:
-            # Show Dialog
             dlg = SplitDialog(self)
             if dlg.exec_() == QDialog.Accepted:
                 self.save_state()
@@ -1183,28 +1266,20 @@ class ProSportsAnalyzer(QMainWindow):
                 mid = self.current_frame
 
                 if dlg.choice == "left":
-                    s1 = {
-                        "start": old["start"],
-                        "end": mid + 1,
-                    }  # Python range style (exclusive end)
+                    s1 = {"start": old["start"], "end": mid + 1}
                     s2 = {"start": mid + 1, "end": old["end"]}
-                else:  # right
+                else:
                     s1 = {"start": old["start"], "end": mid}
                     s2 = {"start": mid, "end": old["end"]}
 
-                # Validation to prevent empty segments
-                valid = True
                 if s1["end"] <= s1["start"] or s2["end"] <= s2["start"]:
                     QMessageBox.warning(
-                        self, "Ошибка", "Нельзя разрезать на самом краю отрезка!"
+                        self, "Ошибка", "Нельзя разрезать на самом краю!"
                     )
-                    valid = False
-
-                if valid:
+                else:
                     self.segments.pop(idx)
                     self.segments.insert(idx, s2)
                     self.segments.insert(idx, s1)
-                    # Select appropriate segment based on split logic
                     self.timeline.selected_segment_idx = (
                         idx if dlg.choice == "left" else idx + 1
                     )
@@ -1290,17 +1365,13 @@ class ProSportsAnalyzer(QMainWindow):
             self.scrubber.setValue(self.current_frame)
             self.scrubber.blockSignals(False)
 
-        # 1. Global Stats
         self.lbl_global_frame.setText(f"Кадр: {self.current_frame}")
         t = self.current_frame / self.fps if self.fps > 0 else 0
         self.lbl_global_time.setText(f"Время: {t:.2f}s")
 
-        total_sec = self.total_frames / self.fps if self.fps > 0 else 0
-        self.lbl_global_duration.setText(f"Длительность: {total_sec:.2f}s")
-        self.lbl_total_marks.setText(f"Всего меток: {len(self.markers)}")
-
-        # 2. Selected Marker Stats
+        idx = self.timeline.selected_segment_idx
         if self.timeline.selected_marker_idx != -1:
+            # MARKER SELECTED
             if self.timeline.selected_marker_idx < len(self.markers):
                 m = self.markers[self.timeline.selected_marker_idx]
                 self.lbl_info_seg.setText(f"МЕТКА: {m['tag']}")
@@ -1310,16 +1381,13 @@ class ProSportsAnalyzer(QMainWindow):
                 self.lbl_seg_duration.setText("Длит. (всего): -")
                 self.lbl_seg_marks.setText("-")
                 self.lbl_tempo.setText("")
-            return
 
-        # 3. Selected Segment Stats
-        idx = self.timeline.selected_segment_idx
-        if idx != -1 and idx < len(self.segments):
+        elif idx != -1 and idx < len(self.segments):
+            # SEGMENT SELECTED
             seg = self.segments[idx]
             s, e = seg["start"], seg["end"]
 
             is_inside = s <= self.current_frame <= e
-
             rel_f = self.current_frame - s
             rel_t = rel_f / self.fps if self.fps > 0 else 0
 
@@ -1334,7 +1402,6 @@ class ProSportsAnalyzer(QMainWindow):
 
             k = e - s
             dur = k / self.fps if self.fps > 0 else 0
-
             vis_marks = [
                 m
                 for m in self.markers
@@ -1344,19 +1411,16 @@ class ProSportsAnalyzer(QMainWindow):
             tempo = (n / dur * 60) if dur > 0 else 0
 
             self.lbl_info_seg.setText(f"Отрезок #{idx + 1}")
-
             self.lbl_rel_frame.setText(f"Кадр (отр): {rel_f}{suffix}")
             self.lbl_rel_frame.setStyleSheet(color_style_frame)
-
             self.lbl_rel_time.setText(f"Время (отр): {rel_t:.2f}s{suffix}")
             self.lbl_rel_time.setStyleSheet(color_style_time)
-
             self.lbl_seg_total_frames.setText(f"Кадров (всего): {k}")
             self.lbl_seg_duration.setText(f"Длит. (всего): {dur:.2f}s")
-
             self.lbl_seg_marks.setText(f"Метки (отр): {n}")
             self.lbl_tempo.setText(f"SPM: {tempo:.1f}")
         else:
+            # NO SELECTION
             self.lbl_info_seg.setText("Нет выбора")
             self.lbl_rel_frame.setText("Кадр (отр): -")
             self.lbl_rel_time.setText("Время (отр): -")
@@ -1364,9 +1428,6 @@ class ProSportsAnalyzer(QMainWindow):
             self.lbl_seg_duration.setText("Длит. (всего): -")
             self.lbl_seg_marks.setText("Метки (отр): -")
             self.lbl_tempo.setText("SPM: 0.0")
-
-            self.lbl_rel_frame.setStyleSheet("color: #e0e0e0;")
-            self.lbl_rel_time.setStyleSheet("color: #00ffff; font-weight: bold;")
 
     def on_video_finished(self):
         self.playing = False
@@ -1407,34 +1468,22 @@ class ProSportsAnalyzer(QMainWindow):
         if not self.segments:
             return
         curr = self.timeline.selected_segment_idx
-        if curr == -1:
-            new_idx = 0
-        else:
-            new_idx = min(len(self.segments) - 1, curr + 1)
-
+        new_idx = min(len(self.segments) - 1, curr + 1)
         self.timeline.selected_segment_idx = new_idx
         self.timeline.selected_marker_idx = -1
         self.timeline.update()
-
-        new_start = self.segments[new_idx]["start"]
-        self.seek_video(new_start)
+        self.seek_video(self.segments[new_idx]["start"])
         self.calculate_stats()
 
     def prev_segment(self):
         if not self.segments:
             return
         curr = self.timeline.selected_segment_idx
-        if curr == -1:
-            new_idx = 0
-        else:
-            new_idx = max(0, curr - 1)
-
+        new_idx = max(0, curr - 1)
         self.timeline.selected_segment_idx = new_idx
         self.timeline.selected_marker_idx = -1
         self.timeline.update()
-
-        new_start = self.segments[new_idx]["start"]
-        self.seek_video(new_start)
+        self.seek_video(self.segments[new_idx]["start"])
         self.calculate_stats()
 
     def normalize_key(self, key_code):
@@ -1475,11 +1524,12 @@ class ProSportsAnalyzer(QMainWindow):
         }
         return cyr_to_lat.get(key_code, key_code)
 
-    def keyPressEvent(self, event):
+    def keyPressEvent(self, event: QKeyEvent):
         if self.is_merge_mode:
             return super().keyPressEvent(event)
 
         raw_key = event.key()
+        modifiers = event.modifiers()
 
         if raw_key == Qt.Key_F11:
             if self.isFullScreen():
@@ -1488,27 +1538,31 @@ class ProSportsAnalyzer(QMainWindow):
                 self.showFullScreen()
             return
 
-        k = self.normalize_key(raw_key)
+        norm_key = self.normalize_key(raw_key)
+
+        full_code = int(modifiers | norm_key)
 
         hk = self.settings.data["hotkeys"]
 
-        if k == hk["play_pause"]:
+        if full_code == hk["play_pause"]:
             self.toggle_play()
-        elif k == hk["mark"]:
+        elif full_code == hk["mark"]:
             self.add_mark()
-        elif k == hk["split"]:
+        elif full_code == hk["split"]:
             self.split_segment()
-        elif k == hk["delete"]:
+        elif full_code == hk["delete"]:
             self.delete_selection()
-        elif k == hk["undo"] and (event.modifiers() & Qt.ControlModifier):
+        elif full_code == hk["undo"]:
             self.undo_action()
-        elif k == hk["frame_prev"]:
+        elif full_code == hk.get("redo", int(Qt.CTRL | Qt.Key_Y)):
+            self.redo_action()
+        elif full_code == hk["frame_prev"]:
             self.step_frame(-1)
-        elif k == hk["frame_next"]:
+        elif full_code == hk["frame_next"]:
             self.step_frame(1)
-        elif k == hk.get("seg_prev", Qt.Key_A):
+        elif full_code == hk.get("seg_prev", Qt.Key_A):
             self.prev_segment()
-        elif k == hk.get("seg_next", Qt.Key_D):
+        elif full_code == hk.get("seg_next", Qt.Key_D):
             self.next_segment()
         else:
             super().keyPressEvent(event)
