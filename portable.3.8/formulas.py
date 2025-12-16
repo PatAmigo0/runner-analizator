@@ -1,3 +1,6 @@
+# type: ignore
+
+from PySide2.QtCore import Qt
 from PySide2.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -10,6 +13,7 @@ from PySide2.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
 )
+from utils import apply_dark_title_bar, create_dark_msg_box
 
 
 class FormulasWindow(QDialog):
@@ -18,16 +22,19 @@ class FormulasWindow(QDialog):
         self.setWindowTitle("Менеджер Формул")
         self.resize(600, 400)
 
-        # Строгий стиль окна
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
         self.setStyleSheet("""
-            QDialog { background-color: #1e1e1e; color: #fff; }
+            QDialog { background-color: #1e1e1e; color: #fff; font-family: Segoe UI; }
             QTableWidget { background-color: #252526; color: #fff; gridline-color: #333; border: 1px solid #333; }
             QHeaderView::section { background-color: #333; color: #fff; padding: 4px; border: 1px solid #444; }
             QTextEdit { background-color: #252526; color: #fff; border: 1px solid #333; }
-            QPushButton { background-color: #3a3a3a; color: #fff; border: 1px solid #555; padding: 6px; }
+            QPushButton { background-color: #3a3a3a; color: #fff; border: 1px solid #555; padding: 6px; border-radius: 3px; }
             QPushButton:hover { background-color: #505050; }
+            QPushButton:pressed { background-color: #0078d7; border-color: #0078d7; }
         """)
 
+        apply_dark_title_bar(self)
         self.init_ui()
 
         # Загрузка сохраненных формул
@@ -45,7 +52,7 @@ class FormulasWindow(QDialog):
             "Синтаксис Python. Пример: (n / t) * 60"
         )
         info.setStyleSheet(
-            "color: #ccc; background: #252526; padding: 8px; border: 1px solid #333;"
+            "color: #ccc; background: #252526; padding: 10px; border: 1px solid #333; border-radius: 4px;"
         )
         layout.addWidget(info)
 
@@ -63,7 +70,7 @@ class FormulasWindow(QDialog):
         btn_del.clicked.connect(self.delete_row)
         btn_calc = QPushButton("РАССЧИТАТЬ")
         btn_calc.setStyleSheet(
-            "background-color: #0078d7; font-weight: bold; border: none;"
+            "background-color: #0078d7; font-weight: bold; border: 1px solid #005a9e;"
         )
         btn_calc.clicked.connect(self.calculate_all)
 
@@ -108,7 +115,10 @@ class FormulasWindow(QDialog):
             return
         ctx = self.get_context()
         if not ctx:
-            QMessageBox.warning(self, "Ошибка", "Не выбран отрезок!")
+            msg = create_dark_msg_box(
+                self, "Ошибка", "Не выбран отрезок!", QMessageBox.Warning
+            )
+            msg.exec_()
             return
 
         res_txt = f"Данные: N={ctx['n']}, T={ctx['t']:.3f}s\n\n"
@@ -126,8 +136,18 @@ class FormulasWindow(QDialog):
         res_win = QDialog(self)
         res_win.setWindowTitle("Результат")
         res_win.resize(300, 200)
+
+        # Тоже убираем ? и красим заголовок у окна результата
+        res_win.setWindowFlags(res_win.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        apply_dark_title_bar(res_win)
+
+        res_win.setStyleSheet(
+            "background-color: #2b2b2b; color: #ffffff; font-family: Segoe UI;"
+        )
+
         ll = QVBoxLayout(res_win)
         t = QTextEdit(res_txt)
         t.setReadOnly(True)
+        t.setStyleSheet("border: 1px solid #444; background: #1e1e1e; color: #fff;")
         ll.addWidget(t)
         res_win.exec_()

@@ -1,49 +1,38 @@
 # type: ignore
 
 import copy
-import ctypes
-import json
 import os
 import sys
 import time
-from ctypes import byref, c_int, sizeof
 
 import cv2
+from dialogs import (
+    GeneralSettingsDialog,
+    HotkeyEditor,
+    ProxyProgressDialog,
+    SplitDialog,
+)
 from formulas import FormulasWindow
-
-# Импорт TimelineWidget
-try:
-    from timeline import TimelineWidget
-except ImportError:
-    from PySide2.QtWidgets import QWidget
-
-    class TimelineWidget(QWidget):
-        pass
-
-
-from PySide2 import __file__ as psf  # noqa
-from PySide2.QtCore import QMutex, QRect, Qt, QThread, Signal, Slot, QPointF
+from PySide2.QtCore import QPointF, QRect, Qt, Slot
 from PySide2.QtGui import (
     QBrush,
     QColor,
     QFont,
     QIcon,
     QImage,
-    QKeySequence,
+    QKeyEvent,
     QPainter,
     QPixmap,
-    QKeyEvent,
 )
 from PySide2.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QColorDialog,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -55,14 +44,23 @@ from PySide2.QtWidgets import (
     QSizePolicy,
     QSlider,
     QStackedLayout,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+from settings import SettingsManager
+from timeline import TimelineWidget
+from utils import (
+    apply_dark_title_bar,
+    create_dark_msg_box,
+    get_resource_path,
+    stop_playback,
+    undoable,
+)
+from video_engine import IS_DEBUG, ProxyGeneratorThread
+from video_thread import VideoThread
 
 is_exe_version = 0
-if "__compiled__" not in globals():
+if IS_DEBUG:
     import PySide2
 
     dirname = os.path.dirname(PySide2.__file__)
@@ -72,459 +70,22 @@ else:
     is_exe_version = 1
 
 try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-        "arseni.kuskou.prosportsanalyzer.1.7"
-    )
+    import ctypes
+
+    appid = "arseni.kuskou.prosportsanalyzer.1.7.stable"
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
 except ImportError:
     pass
 
 
-def get_resource_path(relative_path):
-    try:
-        base_path = os.path.dirname(__file__)
-    except NameError:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-
-
-# --- SETTINGS MANAGER ---
-class SettingsManager:
-    def __init__(self):
-        try:
-            from PySide2.QtCore import QStandardPaths
-
-            config_path = QStandardPaths.writableLocation(
-                QStandardPaths.AppConfigLocation
-            )
-            self.app_dir = os.path.join(config_path, "ProSportsAnalyzer")
-            if not os.path.exists(self.app_dir):
-                os.makedirs(self.app_dir)
-        except Exception:
-            self.app_dir = os.getcwd()
-
-        self.filepath = os.path.join(self.app_dir, "settings.json")
-
-        self.default_hotkeys = {
-            "play_pause": int(Qt.Key_Space),
-            "mark": int(Qt.Key_M),
-            "split": int(Qt.Key_S),
-            "delete": int(Qt.Key_Delete),
-            "undo": int(Qt.CTRL | Qt.Key_Z),
-            "redo": int(Qt.CTRL | Qt.Key_Y),
-            "frame_prev": int(Qt.Key_Left),
-            "frame_next": int(Qt.Key_Right),
-            "seg_prev": int(Qt.Key_A),
-            "seg_next": int(Qt.Key_D),
-        }
-        self.data = {
-            "hotkeys": self.default_hotkeys.copy(),
-            "formulas": [],
-            "last_dir": "",
-        }
-        self.load()
-
-    def load(self):
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    if not content.strip():
-                        return
-                    loaded = json.loads(content)
-
-                    if "hotkeys" in loaded:
-                        for k, v in loaded["hotkeys"].items():
-                            self.data["hotkeys"][k] = int(v)
-                        for k, v in self.default_hotkeys.items():
-                            if k not in self.data["hotkeys"]:
-                                self.data["hotkeys"][k] = v
-
-                    if "formulas" in loaded:
-                        self.data["formulas"] = loaded["formulas"]
-                    if "last_dir" in loaded:
-                        self.data["last_dir"] = loaded["last_dir"]
-            except Exception as e:
-                print(f"Error loading settings: {e}")
-
-    def save(self):
-        try:
-            clean_hotkeys = {k: int(v) for k, v in self.data["hotkeys"].items()}
-            data_to_save = {
-                "hotkeys": clean_hotkeys,
-                "formulas": self.data["formulas"],
-                "last_dir": self.data["last_dir"],
-            }
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(data_to_save, f, indent=4)
-        except Exception as e:
-            print(f"Error saving settings: {e}")
-
-
-# --- HOTKEY EDITOR ---
-class HotkeyEditor(QDialog):
-    def __init__(self, parent, current_hotkeys):
-        super().__init__(parent)
-        self.setWindowTitle("Настройка горячих клавиш")
-        self.resize(500, 450)
-        self.hotkeys = current_hotkeys.copy()
-        self.modified = False
-
-        self.names = {
-            "play_pause": "Старт / Пауза",
-            "mark": "Поставить метку",
-            "split": "Разрезать",
-            "delete": "Удалить",
-            "undo": "Отмена (Undo)",
-            "redo": "Повтор (Redo)",
-            "frame_prev": "Кадр назад",
-            "frame_next": "Кадр вперед",
-            "seg_prev": "Пред. отрезок",
-            "seg_next": "След. отрезок",
-        }
-
-        self.setStyleSheet("""
-            QDialog { background-color: #2b2b2b; color: #fff; }
-            QTableWidget { background-color: #333; color: #fff; gridline-color: #555; }
-            QHeaderView::section { background-color: #444; color: #fff; border: 1px solid #555; padding: 4px; }
-            QPushButton { background-color: #444; color: #fff; border: 1px solid #666; padding: 6px; }
-            QPushButton:hover { background-color: #555; }
-        """)
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        self.table = QTableWidget()
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Действие", "Клавиша"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.cellDoubleClicked.connect(self.capture_key)
-        layout.addWidget(self.table)
-
-        layout.addWidget(QLabel("Дважды кликните по строке, затем нажмите комбинацию"))
-
-        btn_box = QHBoxLayout()
-        btn_save = QPushButton("Сохранить")
-        btn_save.clicked.connect(self.accept)
-        btn_cancel = QPushButton("Отмена")
-        btn_cancel.clicked.connect(self.reject)
-        btn_box.addWidget(btn_save)
-        btn_box.addWidget(btn_cancel)
-        layout.addLayout(btn_box)
-        self.refresh_table()
-
-    def refresh_table(self):
-        self.table.setRowCount(0)
-        for key_code_name, key_val in self.hotkeys.items():
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-            name = self.names.get(key_code_name, key_code_name)
-            self.table.setItem(row, 0, QTableWidgetItem(name))
-            seq_str = QKeySequence(int(key_val)).toString()
-            item = QTableWidgetItem(seq_str)
-            item.setData(Qt.UserRole, key_code_name)
-            self.table.setItem(row, 1, item)
-
-    def capture_key(self, row, col):
-        key_name_item = self.table.item(row, 0)
-        action_internal = self.table.item(row, 1).data(Qt.UserRole)
-
-        d = QDialog(self)
-        d.setWindowTitle("Ввод")
-        d.resize(300, 150)
-        ll = QVBoxLayout(d)
-        ll.addWidget(QLabel(f"Нажмите комбинацию для:\n{key_name_item.text()}"))
-
-        captured = []
-
-        def key_press(e):
-            if e.key() in [Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta]:
-                return
-
-            modifiers = e.modifiers()
-            key = e.key()
-            full_code = int(modifiers | key)
-            captured.append(full_code)
-            d.accept()
-
-        d.keyPressEvent = key_press
-        if d.exec_() == QDialog.Accepted and captured:
-            self.hotkeys[action_internal] = captured[0]
-            self.modified = True
-            self.refresh_table()
-
-
-# --- SPLIT DIALOG (FIXED EDGES + CLOSE BUTTON + NO SPACEBAR TRIGGER) ---
-class SplitDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-        # Прозрачность фона для скругленных углов
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
-
-        self.resize(360, 230)
-        self.choice = None
-
-        self.setStyleSheet("""
-            QDialog {
-                background-color: transparent; 
-            }
-            QFrame#MainFrame {
-                background-color: #252526;
-                border: 2px solid #0078d7;
-                border-radius: 12px;
-            }
-            QLabel { 
-                color: #ffffff; font-size: 16px; font-weight: bold; font-family: Segoe UI; border: none;
-            }
-            QLabel#Subtitle {
-                color: #bbbbbb; font-size: 13px; font-weight: normal; margin-bottom: 5px; border: none;
-            }
-            QPushButton { 
-                background-color: #333333; 
-                color: #eeeeee; 
-                border: 1px solid #555555; 
-                padding: 15px; 
-                font-size: 14px; 
-                border-radius: 6px;
-            }
-            QPushButton:hover { 
-                background-color: #3e3e42; 
-                border-color: #0078d7; 
-            }
-            QPushButton:pressed {
-                background-color: #0078d7;
-                color: #ffffff;
-            }
-            QPushButton#CloseBtn {
-                background-color: transparent;
-                border: none;
-                color: #aaaaaa;
-                font-size: 16px;
-                padding: 4px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton#CloseBtn:hover {
-                background-color: #c42b1c;
-                color: white;
-            }
-            QPushButton#CancelBtn {
-                background-color: transparent;
-                border: none;
-                color: #777777;
-                padding: 5px;
-                font-size: 12px;
-            }
-            QPushButton#CancelBtn:hover {
-                color: #aaaaaa;
-            }
-        """)
-
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.frame = QFrame()
-        self.frame.setObjectName("MainFrame")
-        main_layout.addWidget(self.frame)
-
-        layout = QVBoxLayout(self.frame)
-        layout.setContentsMargins(20, 10, 20, 15)
-
-        # Верхняя панель с крестиком
-        top_bar = QHBoxLayout()
-        top_bar.addStretch()
-
-        self.btn_close = QPushButton("✕")
-        self.btn_close.setObjectName("CloseBtn")
-        self.btn_close.setFixedSize(30, 30)
-        self.btn_close.setFocusPolicy(Qt.NoFocus)  # Убираем фокус
-        self.btn_close.clicked.connect(self.reject)
-
-        top_bar.addWidget(self.btn_close)
-        layout.addLayout(top_bar)
-
-        lbl_title = QLabel("ВЫБОР ОТРЕЗКА")
-        lbl_title.setAlignment(Qt.AlignCenter)
-        lbl_title.setStyleSheet("margin-top: -10px; margin-bottom: 5px;")
-        layout.addWidget(lbl_title)
-
-        lbl_sub = QLabel("К какому отрезку отнести ТЕКУЩИЙ кадр?")
-        lbl_sub.setObjectName("Subtitle")
-        lbl_sub.setAlignment(Qt.AlignCenter)
-        layout.addWidget(lbl_sub)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(15)
-
-        self.btn_left = QPushButton("← Влево\n(1 или A)")
-        # Убираем фокус, чтобы Spacebar не нажимал кнопку
-        self.btn_left.setFocusPolicy(Qt.NoFocus)
-        self.btn_left.clicked.connect(lambda: self.set_choice("left"))
-
-        self.btn_right = QPushButton("Вправо →\n(2 или D)")
-        # Убираем фокус, чтобы Spacebar не нажимал кнопку
-        self.btn_right.setFocusPolicy(Qt.NoFocus)
-        self.btn_right.clicked.connect(lambda: self.set_choice("right"))
-
-        btn_layout.addWidget(self.btn_left)
-        btn_layout.addWidget(self.btn_right)
-        layout.addLayout(btn_layout)
-
-        layout.addStretch()
-
-        btn_cancel = QPushButton("Отмена (Esc)")
-        btn_cancel.setObjectName("CancelBtn")
-        btn_cancel.setFocusPolicy(Qt.NoFocus)  # Убираем фокус
-        btn_cancel.clicked.connect(self.reject)
-        layout.addWidget(btn_cancel, alignment=Qt.AlignCenter)
-
-    def set_choice(self, val):
-        self.choice = val
-        self.accept()
-
-    def keyPressEvent(self, event):
-        k = event.key()
-        if k == Qt.Key_1 or k == Qt.Key_A or k == 1060:
-            self.set_choice("left")
-        elif k == Qt.Key_2 or k == Qt.Key_D or k == 1042:
-            self.set_choice("right")
-        elif k == Qt.Key_Escape:
-            self.reject()
-        else:
-            super().keyPressEvent(event)
-
-
-# --- VIDEO THREAD ---
-class VideoThread(QThread):
-    change_pixmap_signal = Signal(object)
-    finished_signal = Signal()
-    video_info_signal = Signal(dict)
-
-    def __init__(self):
-        super().__init__()
-        self.cap = None
-        self._run_flag = True
-        self.fps = 30
-        self.speed = 1.0
-        self.current_frame_num = 0
-        self.mutex = QMutex()
-
-    def load_video(self, path):
-        self.stop()
-        self.mutex.lock()
-        try:
-            if self.cap:
-                self.cap.release()
-            self.cap = cv2.VideoCapture(path)
-            if self.cap.isOpened():
-                info = {
-                    "fps": self.cap.get(cv2.CAP_PROP_FPS),
-                    "width": int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                    "height": int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                    "total": int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-                }
-                self.fps = info["fps"] if info["fps"] > 0 else 30
-                self.current_frame_num = 0
-                self.video_info_signal.emit(info)
-        finally:
-            self.mutex.unlock()
-        self.read_one_frame()
-
-    def read_one_frame(self):
-        self.mutex.lock()
-        try:
-            if self.cap and self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if ret:
-                    self.current_frame_num = (
-                        int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-                    )
-                    self.change_pixmap_signal.emit(frame)
-        finally:
-            self.mutex.unlock()
-
-    def seek(self, frame_num):
-        self.mutex.lock()
-        try:
-            if self.cap and self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-                ret, frame = self.cap.read()
-                if ret:
-                    self.current_frame_num = (
-                        int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-                    )
-                    self.change_pixmap_signal.emit(frame)
-        finally:
-            self.mutex.unlock()
-
-    def run(self):
-        self._run_flag = True
-        while self._run_flag:
-            start_time = time.time()
-            self.mutex.lock()
-            frame_ready = False
-            frame = None
-            try:
-                if not self._run_flag:
-                    self.mutex.unlock()
-                    break
-                if self.cap and self.cap.isOpened():
-                    ret, frame = self.cap.read()
-                    if ret:
-                        self.current_frame_num = (
-                            int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-                        )
-                        frame_ready = True
-                    else:
-                        self.finished_signal.emit()
-                        self._run_flag = False
-                else:
-                    self._run_flag = False
-            finally:
-                self.mutex.unlock()
-
-            if frame_ready and frame is not None:
-                self.change_pixmap_signal.emit(frame)
-
-            if self._run_flag and self.fps > 0:
-                processing_time = time.time() - start_time
-                target_delay = 1.0 / (self.fps * self.speed)
-                sleep_time = target_delay - processing_time
-                if sleep_time > 0:
-                    self.msleep(int(sleep_time * 1000))
-                else:
-                    self.msleep(1)
-
-    def stop(self):
-        self._run_flag = False
-        self.wait(500)
-        if self.isRunning():
-            self.terminate()
-
-
-# --- MAIN WINDOW ---
 class ProSportsAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = SettingsManager()
-
-        self.setWindowTitle(f"Pro Sports Analyzer v1.6.{is_exe_version}")
+        self.setWindowTitle(f"Pro Sports Analyzer v1.7.{is_exe_version}")
         self.resize(1600, 950)
         self.setAcceptDrops(True)
-
-        # --- DARK TITLE BAR FOR WINDOWS ---
-        try:
-            hwnd = self.winId()
-            value = c_int(1)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                int(hwnd), 20, byref(value), sizeof(value)
-            )
-        except Exception:
-            pass
+        apply_dark_title_bar(self)
 
         self.setStyleSheet("""
             QMainWindow { background-color: #1e1e1e; color: #f0f0f0; font-family: Segoe UI; }
@@ -542,8 +103,37 @@ class ProSportsAnalyzer(QMainWindow):
             QListWidget { background-color: #222; border: 1px solid #444; color: #ffffff; outline: none; }
             QListWidget::item:hover { background-color: #2a2a2a; }
             QListWidget::item:selected { background-color: #222; color: #ffffff; }
+            
             QSlider::groove:horizontal { border: 1px solid #444; height: 8px; background: #333; margin: 2px 0; border-radius: 4px; }
             QSlider::handle:horizontal { background: #0078d7; border: 1px solid #0078d7; width: 18px; height: 18px; margin: -6px 0; border-radius: 9px; }
+            
+            QProgressBar { border: 1px solid #444; text-align: center; color: white; }
+            QProgressBar::chunk { background-color: #0078d7; }
+
+            /* --- СТИЛИ ДЛЯ СКРОЛЛБАРА (ТЕМНЫЙ) --- */
+            QScrollBar:horizontal {
+                border: none;
+                background: #1e1e1e;
+                height: 14px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #444;
+                min-width: 20px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #666;
+            }
+            QScrollBar::add-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::sub-line:horizontal {
+                width: 0px;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: #2b2b2b;
+            }
         """)
 
         self.total_frames = 100
@@ -553,26 +143,26 @@ class ProSportsAnalyzer(QMainWindow):
         self.playback_speed = 1.0
         self.current_ext = ""
         self.last_frame = None
-
         self.segments = []
         self.markers = []
-
         self.history = []
         self.redo_stack = []
         self.is_undoing = False
-
         self.is_merge_mode = False
         self.merge_buffer = []
-
         self.video_zoom = 1.0
         self.video_pan = QPointF(0, 0)
         self.dragging_video = False
         self.last_mouse_pos = QPointF()
-
         self.current_marker_color = "#ff0000"
         self.current_marker_tag = "Main"
+        self.proxy_thread = None
+        self.proxy_dialog = None
 
-        self.thread = VideoThread()
+        # БУФЕР ДЛЯ ПЕРЕНОСА ДАННЫХ ПРИ ПЕРЕЗАГРУЗКЕ ВИДЕО
+        self._temp_state_for_reload = None
+
+        self.thread = VideoThread(self.settings)
         self.thread.change_pixmap_signal.connect(self.update_image)
         self.thread.finished_signal.connect(self.on_video_finished)
         self.thread.video_info_signal.connect(self.set_video_info)
@@ -585,53 +175,69 @@ class ProSportsAnalyzer(QMainWindow):
     def init_ui(self):
         icon_path = get_resource_path("favicon.ico")
         self.setWindowIcon(QIcon(icon_path))
-
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        cw = QWidget()
+        self.setCentralWidget(cw)
+        ml = QVBoxLayout(cw)
+        ml.setContentsMargins(10, 10, 10, 10)
+        ml.setSpacing(10)
 
         top_layout = QHBoxLayout()
 
-        # LEFT PANEL
-        left_panel = QWidget()
-        left_panel.setFixedWidth(320)
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setAlignment(Qt.AlignTop)
+        # Left Panel
+        lp = QWidget()
+        lp.setFixedWidth(320)
+        ll = QVBoxLayout(lp)
+        ll.setContentsMargins(0, 0, 0, 0)
+        ll.setAlignment(Qt.AlignTop)
 
-        gb_file = QGroupBox("Файл и Управление")
-        l_file = QVBoxLayout()
-        btn_open = QPushButton("📂 Открыть видео")
-        btn_open.clicked.connect(self.open_file)
-        btn_hotkeys = QPushButton("⌨ Горячие клавиши")
-        btn_hotkeys.clicked.connect(self.open_hotkeys_dialog)
-        l_file.addWidget(btn_open)
-        l_file.addWidget(btn_hotkeys)
+        gb_f = QGroupBox("Файл и Управление")
+        lf = QVBoxLayout()
+        b_op = QPushButton("📂 Открыть видео")
+        b_op.clicked.connect(self.open_file)
 
-        l_info_grid = QVBoxLayout()
+        h_sets = QHBoxLayout()
+        b_hk = QPushButton("⌨ Клавиши")
+        b_hk.clicked.connect(self.open_hotkeys_dialog)
+        b_gs = QPushButton("⚙ Настройки")
+        b_gs.clicked.connect(self.open_general_settings)
+        h_sets.addWidget(b_hk)
+        h_sets.addWidget(b_gs)
+
+        lf.addWidget(b_op)
+        lf.addLayout(h_sets)
+
+        self.btn_create_proxy_manual = QPushButton("⚡ Создать Прокси")
+        self.btn_create_proxy_manual.setStyleSheet(
+            "background-color: #0078d7; font-weight: bold;"
+        )
+        self.btn_create_proxy_manual.hide()
+        self.btn_create_proxy_manual.clicked.connect(self.manual_create_proxy)
+        lf.addWidget(self.btn_create_proxy_manual)
+
+        l_info = QVBoxLayout()
         self.lbl_vid_res = QLabel("Разрешение: -")
         self.lbl_vid_fps = QLabel("FPS: -")
-        l_info_grid.addWidget(self.lbl_vid_res)
-        l_info_grid.addWidget(self.lbl_vid_fps)
-        l_file.addLayout(l_info_grid)
-        gb_file.setLayout(l_file)
-        left_layout.addWidget(gb_file)
+        self.lbl_proxy_status = QLabel("")
+        l_info.addWidget(self.lbl_vid_res)
+        l_info.addWidget(self.lbl_vid_fps)
+        l_info.addWidget(self.lbl_proxy_status)
+        lf.addLayout(l_info)
+        gb_f.setLayout(lf)
+        ll.addWidget(gb_f)
 
-        gb_markers = QGroupBox("Метки")
-        l_markers = QVBoxLayout()
+        # Markers
+        gb_m = QGroupBox("Метки")
+        lm = QVBoxLayout()
         self.btn_mark = QPushButton("🚩 ПОСТАВИТЬ МЕТКУ")
         self.btn_mark.setMinimumHeight(40)
         self.btn_mark.setStyleSheet(
             "background-color: #b30000; font-weight: bold; font-size: 14px; border: 1px solid #f00;"
         )
         self.btn_mark.clicked.connect(self.add_mark)
-        l_markers.addWidget(self.btn_mark)
+        lm.addWidget(self.btn_mark)
 
         self.lbl_marker_mode = QLabel("Режим: Создание")
-        l_markers.addWidget(self.lbl_marker_mode)
+        lm.addWidget(self.lbl_marker_mode)
 
         h_m1 = QHBoxLayout()
         self.btn_color = QPushButton("")
@@ -643,27 +249,31 @@ class ProSportsAnalyzer(QMainWindow):
         h_m1.addWidget(QLabel("Цвет:"))
         h_m1.addWidget(self.btn_color)
         h_m1.addWidget(self.inp_tag)
-        l_markers.addLayout(h_m1)
+        lm.addLayout(h_m1)
 
-        l_markers.addWidget(QLabel("Список меток:"))
+        lm.addWidget(QLabel("Список меток:"))
         self.list_filters = QListWidget()
-        self.list_filters.itemChanged.connect(self.on_filter_changed)
+
+        # --- ИСПРАВЛЕНИЕ: Отключаем выделение строк, оставляем только чекбоксы ---
+        self.list_filters.setSelectionMode(QAbstractItemView.NoSelection)
         self.list_filters.setFocusPolicy(Qt.NoFocus)
-        l_markers.addWidget(self.list_filters)
-        gb_markers.setLayout(l_markers)
-        left_layout.addWidget(gb_markers)
 
-        gb_actions = QGroupBox("Действия")
-        l_actions = QVBoxLayout()
+        self.list_filters.itemChanged.connect(self.on_filter_changed)
+        lm.addWidget(self.list_filters)
+        gb_m.setLayout(lm)
+        ll.addWidget(gb_m)
 
-        h_undo_redo = QHBoxLayout()
+        # Actions
+        gb_a = QGroupBox("Действия")
+        la = QVBoxLayout()
+        h_ur = QHBoxLayout()
         self.btn_undo = QPushButton("↶ Отмена")
         self.btn_undo.clicked.connect(self.undo_action)
         self.btn_redo = QPushButton("↷ Повтор")
         self.btn_redo.clicked.connect(self.redo_action)
-        h_undo_redo.addWidget(self.btn_undo)
-        h_undo_redo.addWidget(self.btn_redo)
-        l_actions.addLayout(h_undo_redo)
+        h_ur.addWidget(self.btn_undo)
+        h_ur.addWidget(self.btn_redo)
+        la.addLayout(h_ur)
 
         self.btn_split = QPushButton("✂ Разрезать")
         self.btn_split.clicked.connect(self.split_segment)
@@ -675,16 +285,17 @@ class ProSportsAnalyzer(QMainWindow):
         self.btn_delete = QPushButton("🗑 Удалить")
         self.btn_delete.clicked.connect(self.delete_selection)
 
-        l_actions.addWidget(self.btn_split)
-        l_actions.addWidget(self.btn_merge)
-        l_actions.addWidget(self.btn_cancel_merge)
-        l_actions.addWidget(self.btn_delete)
-        gb_actions.setLayout(l_actions)
-        left_layout.addWidget(gb_actions)
-        left_layout.addStretch()
-        top_layout.addWidget(left_panel)
+        la.addWidget(self.btn_split)
+        la.addWidget(self.btn_merge)
+        la.addWidget(self.btn_cancel_merge)
+        la.addWidget(self.btn_delete)
+        gb_a.setLayout(la)
+        ll.addWidget(gb_a)
 
-        # CENTER VIDEO
+        ll.addStretch()
+        top_layout.addWidget(lp)
+
+        # Video Center
         self.video_container = QWidget()
         self.video_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_container.setStyleSheet(
@@ -696,14 +307,13 @@ class ProSportsAnalyzer(QMainWindow):
         self.video_container.mouseMoveEvent = self.video_mouse_move
         self.video_container.mouseReleaseEvent = self.video_mouse_release
 
-        self.stack_layout = QStackedLayout(self.video_container)
-        self.stack_layout.setStackingMode(QStackedLayout.StackAll)
-
+        sl = QStackedLayout(self.video_container)
+        sl.setStackingMode(QStackedLayout.StackAll)
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.video_label.setScaledContents(False)
-        self.stack_layout.addWidget(self.video_label)
+        sl.addWidget(self.video_label)
 
         self.overlay_widget = QLabel("РЕЖИМ ОБЪЕДИНЕНИЯ\nВЫБЕРИТЕ 2 ОТРЕЗКА")
         self.overlay_widget.setAlignment(Qt.AlignCenter)
@@ -711,81 +321,75 @@ class ProSportsAnalyzer(QMainWindow):
             "background-color: rgba(0, 50, 0, 200); color: #0f0; font-size: 24px; font-weight: bold;"
         )
         self.overlay_widget.hide()
-        self.stack_layout.addWidget(self.overlay_widget)
-
+        sl.addWidget(self.overlay_widget)
         top_layout.addWidget(self.video_container, stretch=1)
 
-        # RIGHT PANEL (ANALYSIS)
-        right_panel = QWidget()
-        right_panel.setFixedWidth(300)
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setAlignment(Qt.AlignTop)
+        # Right Panel
+        rp = QWidget()
+        rp.setFixedWidth(300)
+        rl = QVBoxLayout(rp)
+        rl.setAlignment(Qt.AlignTop)
 
         gb_calc = QGroupBox("Анализ")
         gb_calc.setStyleSheet("QGroupBox { border: 1px solid #0078d7; }")
-        l_calc = QVBoxLayout()
+        lc = QVBoxLayout()
         self.lbl_global_frame = QLabel("Кадр: 0")
         self.lbl_global_time = QLabel("Время: 0.00s")
-
         self.lbl_info_seg = QLabel("Нет выбора")
         self.lbl_info_seg.setStyleSheet(
             "color: #fff; font-weight: bold; font-size: 16px; margin-top: 5px;"
         )
-
         self.lbl_rel_frame = QLabel("Кадр (отр): -")
         self.lbl_rel_time = QLabel("Время (отр): -")
         self.lbl_rel_time.setStyleSheet("color: #00ffff; font-weight: bold;")
-
         self.lbl_seg_total_frames = QLabel("Кадров (всего): -")
         self.lbl_seg_duration = QLabel("Длит. (всего): -")
         self.lbl_seg_marks = QLabel("Метки (отр): -")
-
         self.lbl_tempo = QLabel("SPM: 0.0")
         self.lbl_tempo.setStyleSheet(
             "color: #00ff00; font-size: 22px; font-weight: bold; background: #222; padding: 5px; border-radius: 4px; margin-top: 5px;"
         )
 
-        l_calc.addWidget(self.lbl_global_frame)
-        l_calc.addWidget(self.lbl_global_time)
-        l_calc.addWidget(self.lbl_info_seg)
-        l_calc.addWidget(self.lbl_rel_frame)
-        l_calc.addWidget(self.lbl_rel_time)
-        l_calc.addWidget(self.lbl_seg_total_frames)
-        l_calc.addWidget(self.lbl_seg_duration)
-        l_calc.addWidget(self.lbl_seg_marks)
-        l_calc.addWidget(self.lbl_tempo)
-        gb_calc.setLayout(l_calc)
-        right_layout.addWidget(gb_calc)
+        lc.addWidget(self.lbl_global_frame)
+        lc.addWidget(self.lbl_global_time)
+        lc.addWidget(self.lbl_info_seg)
+        lc.addWidget(self.lbl_rel_frame)
+        lc.addWidget(self.lbl_rel_time)
+        lc.addWidget(self.lbl_seg_total_frames)
+        lc.addWidget(self.lbl_seg_duration)
+        lc.addWidget(self.lbl_seg_marks)
+        lc.addWidget(self.lbl_tempo)
+        gb_calc.setLayout(lc)
+        rl.addWidget(gb_calc)
 
-        btn_formulas = QPushButton("📐 Конструктор формул")
-        btn_formulas.clicked.connect(self.show_formulas)
-        btn_formulas.setStyleSheet(
+        btn_form = QPushButton("📐 Конструктор формул")
+        btn_form.clicked.connect(self.show_formulas)
+        btn_form.setStyleSheet(
             "background-color: #6a0dad; margin-top: 10px; padding: 10px;"
         )
-        right_layout.addWidget(btn_formulas)
+        rl.addWidget(btn_form)
 
         gb_speed = QGroupBox("Скорость")
-        h_speed = QHBoxLayout()
+        hs = QHBoxLayout()
         self.spin_speed = QDoubleSpinBox()
         self.spin_speed.setRange(0.1, 5.0)
         self.spin_speed.setValue(1.0)
         self.spin_speed.setSingleStep(0.1)
         self.spin_speed.valueChanged.connect(self.change_speed)
         self.spin_speed.setFocusPolicy(Qt.ClickFocus)
-        h_speed.addWidget(self.spin_speed)
-        gb_speed.setLayout(h_speed)
-        right_layout.addWidget(gb_speed)
+        hs.addWidget(self.spin_speed)
+        gb_speed.setLayout(hs)
+        rl.addWidget(gb_speed)
+        rl.addStretch()
+        top_layout.addWidget(rp)
+        ml.addLayout(top_layout)
 
-        right_layout.addStretch()
-        top_layout.addWidget(right_panel)
-        main_layout.addLayout(top_layout)
-
-        # --- SLIDER & TIMELINE ---
+        # Bottom
         self.scrubber = QSlider(Qt.Horizontal)
         self.scrubber.setRange(0, 100)
         self.scrubber.setEnabled(False)
         self.scrubber.valueChanged.connect(self.on_scrubber_change)
-        main_layout.addWidget(self.scrubber)
+        ml.addWidget(self.scrubber)
 
         self.timeline = TimelineWidget()
         self.timeline.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -793,12 +397,12 @@ class ProSportsAnalyzer(QMainWindow):
         self.timeline.segment_selected.connect(self.on_timeline_click)
         self.timeline.marker_selected.connect(self.on_selection_changed)
         self.timeline.view_changed.connect(self.update_timeline_scrollbar)
-        main_layout.addWidget(self.timeline)
+        ml.addWidget(self.timeline)
 
         self.timeline_scroll = QScrollBar(Qt.Horizontal)
         self.timeline_scroll.setEnabled(False)
         self.timeline_scroll.valueChanged.connect(self.on_timeline_scroll)
-        main_layout.addWidget(self.timeline_scroll)
+        ml.addWidget(self.timeline_scroll)
 
         self.fix_focus_policies()
         self.update_ui_marker_controls()
@@ -810,18 +414,21 @@ class ProSportsAnalyzer(QMainWindow):
         self.timeline_scroll.setFocusPolicy(Qt.NoFocus)
         self.setFocus()
 
-    # --- VIDEO ZOOM & PAN ---
     def video_wheel_event(self, event):
         angle = event.angleDelta().y()
+        MAX_ZOOM = 50.0
+        MIN_ZOOM = 1.0
+        ZOOM_STEP = 1.1
         if angle > 0:
-            self.video_zoom *= 1.1
+            self.video_zoom *= ZOOM_STEP
         else:
-            self.video_zoom /= 1.1
+            self.video_zoom /= ZOOM_STEP
 
-        if self.video_zoom < 1.0:
-            self.video_zoom = 1.0
+        if self.video_zoom > MAX_ZOOM:
+            self.video_zoom = MAX_ZOOM
+        elif self.video_zoom < MIN_ZOOM:
+            self.video_zoom = MIN_ZOOM
             self.video_pan = QPointF(0, 0)
-
         self.redraw_current_frame()
 
     def video_mouse_press(self, event):
@@ -843,7 +450,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.video_container.setCursor(Qt.ArrowCursor)
 
     def on_scrubber_change(self, val):
-        if hasattr(self, "thread") and self.thread.cap and self.thread.cap.isOpened():
+        if hasattr(self, "thread") and self.thread.engine.cap:
             if self.scrubber.isEnabled() and not self.scrubber.signalsBlocked():
                 self.seek_video(val)
         self.setFocus()
@@ -864,13 +471,92 @@ class ProSportsAnalyzer(QMainWindow):
         if not self.timeline_scroll.signalsBlocked():
             self.timeline.set_view_start_from_scrollbar(val)
 
+    @stop_playback
     def open_hotkeys_dialog(self):
         dlg = HotkeyEditor(self, self.settings.data["hotkeys"])
         if dlg.exec_() == QDialog.Accepted:
             if dlg.modified:
                 self.settings.data["hotkeys"] = dlg.hotkeys
                 self.settings.save()
-                QMessageBox.information(self, "Инфо", "Настройки сохранены.")
+                msg = create_dark_msg_box(
+                    self, "Инфо", "Настройки сохранены.", QMessageBox.Information
+                )
+                msg.exec_()
+        self.setFocus()
+
+    def capture_session_state(self):
+        """Сохраняет текущие данные сессии (метки, сегменты, историю)"""
+        return {
+            "segments": copy.deepcopy(self.segments),
+            "markers": copy.deepcopy(self.markers),
+            "history": copy.deepcopy(self.history),
+            "redo_stack": copy.deepcopy(self.redo_stack),
+            "fps": self.fps,
+        }
+
+    @stop_playback
+    def open_general_settings(self):
+        curr_proxy = getattr(self.thread.engine, "proxy_path", None)
+        if not self.thread.engine.is_proxy_active:
+            curr_proxy = None
+
+        dlg = GeneralSettingsDialog(self, self.settings, curr_proxy)
+        result = dlg.exec_()
+
+        if result == QDialog.Accepted:
+            self.thread.update_settings_live()
+
+            # Обработка удаления (Приоритет)
+            if dlg.delete_requested and self.thread.engine.original_path:
+                # СОХРАНЯЕМ ДАННЫЕ перед перезагрузкой
+                self._temp_state_for_reload = self.capture_session_state()
+
+                self.thread.full_release()
+
+                if self.settings.delete_single_proxy(curr_proxy):
+                    msg = create_dark_msg_box(
+                        self, "Готово", "Прокси удален.", QMessageBox.Information
+                    )
+                    msg.exec_()
+                    # Загрузка (данные восстановятся в set_video_info)
+                    self.check_and_load_video(self.thread.engine.original_path)
+                else:
+                    msg = create_dark_msg_box(
+                        self,
+                        "Ошибка",
+                        "Не удалось удалить файл (возможно заблокирован).",
+                        QMessageBox.Warning,
+                    )
+                    msg.exec_()
+                    self.check_and_load_video(self.thread.engine.original_path)
+                return
+
+            if dlg.need_restart and self.thread.engine.original_path:
+                msg = create_dark_msg_box(
+                    self,
+                    "Перезагрузка",
+                    "Настройки изменены.\nПерезагрузить видео?",
+                    QMessageBox.Question,
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if msg.exec_() == QMessageBox.Yes:
+                    # СОХРАНЯЕМ ДАННЫЕ
+                    self._temp_state_for_reload = self.capture_session_state()
+
+                    current_pos = self.current_frame
+                    if self.settings.get("proxy_quality") != dlg.old_quality:
+                        name, _ = os.path.splitext(
+                            os.path.basename(self.thread.engine.original_path)
+                        )
+                        self.settings.cleanup_old_proxies(name)
+
+                    self.check_and_load_video(self.thread.engine.original_path)
+                    self.seek_video(current_pos)
+
+            msg = create_dark_msg_box(
+                self, "Инфо", "Настройки применены.", QMessageBox.Information
+            )
+            msg.exec_()
         self.setFocus()
 
     def closeEvent(self, event):
@@ -880,38 +566,42 @@ class ProSportsAnalyzer(QMainWindow):
         self.settings.save()
         super().closeEvent(event)
 
-    # --- UNDO / REDO ---
     def undo_action(self):
         if not self.history:
             return
-        current_state = {
-            "segments": copy.deepcopy(self.segments),
-            "markers": copy.deepcopy(self.markers),
-        }
-        self.redo_stack.append(current_state)
-
+        self.redo_stack.append(
+            {
+                "segments": copy.deepcopy(self.segments),
+                "markers": copy.deepcopy(self.markers),
+            }
+        )
         self.is_undoing = True
         state = self.history.pop()
-        self.segments = state["segments"]
+
+        # ЗАЩИТА ОТ "ИСЧЕЗНОВЕНИЯ" ТАЙМЛАЙНА
+        if not state["segments"] and self.total_frames > 0:
+            self.segments = [{"start": 0, "end": self.total_frames}]
+        else:
+            self.segments = state["segments"]
+
         self.markers = state["markers"]
         self.timeline.set_data(self.total_frames, self.fps, self.segments, self.markers)
         self.update_filter_list()
         self.calculate_stats()
         self.redraw_current_frame()
         self.is_undoing = False
-
         self.btn_redo.setEnabled(True)
         self.btn_undo.setEnabled(len(self.history) > 0)
 
     def redo_action(self):
         if not self.redo_stack:
             return
-        current_state = {
-            "segments": copy.deepcopy(self.segments),
-            "markers": copy.deepcopy(self.markers),
-        }
-        self.history.append(current_state)
-
+        self.history.append(
+            {
+                "segments": copy.deepcopy(self.segments),
+                "markers": copy.deepcopy(self.markers),
+            }
+        )
         self.is_undoing = True
         state = self.redo_stack.pop()
         self.segments = state["segments"]
@@ -921,7 +611,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.calculate_stats()
         self.redraw_current_frame()
         self.is_undoing = False
-
         self.btn_redo.setEnabled(len(self.redo_stack) > 0)
         self.btn_undo.setEnabled(True)
 
@@ -930,48 +619,45 @@ class ProSportsAnalyzer(QMainWindow):
             return
         self.redo_stack.clear()
         self.btn_redo.setEnabled(False)
-
-        state = {
-            "segments": copy.deepcopy(self.segments),
-            "markers": copy.deepcopy(self.markers),
-        }
-        self.history.append(state)
+        self.history.append(
+            {
+                "segments": copy.deepcopy(self.segments),
+                "markers": copy.deepcopy(self.markers),
+            }
+        )
         if len(self.history) > 1000:
             self.history.pop(0)
         self.btn_undo.setEnabled(True)
 
-    # --- MARKERS ---
     def pick_color(self):
         init = self.current_marker_color
         idx = self.timeline.selected_marker_idx
         if idx != -1 and idx < len(self.markers):
             init = self.markers[idx]["color"]
-        color = QColorDialog.getColor(initial=QColor(init))
-        if color.isValid():
-            self.apply_color(color.name())
+        col = QColorDialog.getColor(initial=QColor(init))
+        if col.isValid():
+            self.apply_color(col.name())
 
-    def apply_color(self, color_name):
+    @undoable
+    def apply_color(self, c):
         idx = self.timeline.selected_marker_idx
         if idx != -1 and idx < len(self.markers):
-            m = self.markers[idx]
-            if m["color"] != color_name:
-                m["color"] = color_name
-                self.timeline.update()
-                self.redraw_current_frame()
-        else:
-            self.current_marker_color = color_name
-        self.update_ui_marker_controls()
-
-    def update_marker_props_live(self):
-        tag = self.inp_tag.text()
-        idx = self.timeline.selected_marker_idx
-        if idx != -1 and idx < len(self.markers):
-            m = self.markers[idx]
-            m["tag"] = tag
+            self.markers[idx]["color"] = c
             self.timeline.update()
             self.redraw_current_frame()
         else:
-            self.current_marker_tag = tag
+            self.current_marker_color = c
+        self.update_ui_marker_controls()
+
+    def update_marker_props_live(self):
+        t = self.inp_tag.text()
+        idx = self.timeline.selected_marker_idx
+        if idx != -1 and idx < len(self.markers):
+            self.markers[idx]["tag"] = t
+            self.timeline.update()
+            self.redraw_current_frame()
+        else:
+            self.current_marker_tag = t
 
     def update_ui_marker_controls(self):
         idx = self.timeline.selected_marker_idx
@@ -996,44 +682,190 @@ class ProSportsAnalyzer(QMainWindow):
             )
 
     def update_filter_list(self):
-        tags = sorted(list(set(m["tag"] for m in self.markers)))
-        checked_tags = []
-        for i in range(self.list_filters.count()):
-            item = self.list_filters.item(i)
-            if item.checkState() == Qt.Checked:
-                checked_tags.append(item.text())
-
+        # Блокируем сигналы, чтобы добавление элементов не вызывало лишних событий
+        self.list_filters.blockSignals(True)
         self.list_filters.clear()
-        first_run = len(checked_tags) == 0 and len(tags) > 0
+
+        # Получаем все уникальные теги из данных меток
+        tags = sorted(list(set(m["tag"] for m in self.markers)))
 
         for t in tags:
-            item = QListWidgetItem(t)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            if first_run or t in checked_tags:
-                item.setCheckState(Qt.Checked)
-            else:
-                item.setCheckState(Qt.Unchecked)
-            self.list_filters.addItem(item)
+            it = QListWidgetItem(t)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+
+            # Берем состояние видимости ПРЯМО ИЗ ДАННЫХ
+            # Ищем первую попавшуюся метку с этим тегом и смотрим её visible
+            is_visible = True
+            for m in self.markers:
+                if m["tag"] == t:
+                    is_visible = m.get("visible", True)
+                    break
+
+            # Если метка visible=True, ставим галочку
+            it.setCheckState(Qt.Checked if is_visible else Qt.Unchecked)
+            self.list_filters.addItem(it)
+
+        self.list_filters.blockSignals(False)
 
     def on_filter_changed(self, item):
-        tag = item.text()
-        visible = item.checkState() == Qt.Checked
+        t = item.text()
+        v = item.checkState() == Qt.Checked
         for m in self.markers:
-            if m["tag"] == tag:
-                m["visible"] = visible
+            if m["tag"] == t:
+                m["visible"] = v
         self.timeline.update()
         self.calculate_stats()
         self.redraw_current_frame()
         self.setFocus()
 
     def open_file(self):
-        start_dir = self.settings.data.get("last_dir", "")
+        start_dir = self.settings.get("last_dir", "")
         f, _ = QFileDialog.getOpenFileName(self, "Открыть видео", start_dir)
         if f:
-            self.settings.data["last_dir"] = os.path.dirname(f)
-            self.load_video(f)
+            self.settings.set("last_dir", os.path.dirname(f))
+            self.settings.save()
+            self.check_and_load_video(f)
         self.activateWindow()
         self.setFocus()
+
+    def manual_create_proxy(self):
+        if self.thread.engine.original_path:
+            # 1. СОХРАНЯЕМ ДАННЫЕ перед отключением
+            self._temp_state_for_reload = self.capture_session_state()
+
+            self.thread.full_release()
+            self.playing = False
+
+            self.scrubber.setEnabled(False)
+            self.video_label.clear()
+
+            path = self.thread.engine.original_path
+            name, _ = os.path.splitext(os.path.basename(path))
+
+            self.settings.cleanup_old_proxies(name)
+
+            try:
+                proxy_path = self.thread.engine.get_proxy_filename(path)
+            except AttributeError:
+                qual = self.settings.get("proxy_quality", 540)
+                proxy_path = self.thread.engine.generate_proxy_path(path, qual)
+
+            self.start_proxy_generation(path, proxy_path)
+
+    def check_and_load_video(self, path):
+        # Очищаем текущие данные, НО если это перезагрузка для прокси -
+        # данные уже сохранены в self._temp_state_for_reload
+        self.reset_session_data()
+
+        self.current_ext = os.path.splitext(path)[1]
+
+        # ПРОВЕРЯЕМ ГЛОБАЛЬНУЮ НАСТРОЙКУ
+        use_proxy_setting = self.settings.get("use_proxy", True)
+
+        if not use_proxy_setting:
+            self.thread.load_video(path, try_proxy=False)
+            return
+
+        self.thread.load_video(path, try_proxy=True)
+
+        if not self.thread.engine.is_proxy_active:
+            try:
+                proxy_path = self.thread.engine.get_proxy_filename(path)
+            except AttributeError:
+                qual = self.settings.get("proxy_quality", 540)
+                proxy_path = self.thread.engine.generate_proxy_path(path, qual)
+
+            if not os.path.exists(proxy_path):
+                msg = create_dark_msg_box(
+                    self,
+                    "Создание Proxy",
+                    "Для этого видео нет оптимизированной копии.\nСоздать?",
+                    QMessageBox.Question,
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if msg.exec_() == QMessageBox.Yes:
+                    name, _ = os.path.splitext(os.path.basename(path))
+                    self.settings.cleanup_old_proxies(name)
+
+                    # Сохраняем пустое состояние (или текущее) перед созданием
+                    self._temp_state_for_reload = self.capture_session_state()
+
+                    self.start_proxy_generation(path, proxy_path)
+                    self.thread.stop()
+                    return
+
+            elif os.path.exists(proxy_path) and os.path.getsize(proxy_path) < 1000:
+                msg = create_dark_msg_box(
+                    self,
+                    "Ошибка Proxy",
+                    "Найден файл прокси, но он поврежден.\nПересоздать?",
+                    QMessageBox.Question,
+                    QMessageBox.Yes | QMessageBox.No,
+                )
+                if msg.exec_() == QMessageBox.Yes:
+                    name, _ = os.path.splitext(os.path.basename(path))
+                    self.settings.cleanup_old_proxies(name)
+
+                    self._temp_state_for_reload = self.capture_session_state()
+
+                    self.start_proxy_generation(path, proxy_path)
+                    self.thread.stop()
+                    return
+
+    def start_proxy_generation(self, input_path, output_path):
+        self.proxy_dialog = ProxyProgressDialog(self)
+        target_h = self.settings.get("proxy_quality", 540)
+        self.proxy_thread = ProxyGeneratorThread(
+            input_path, output_path, target_height=target_h
+        )
+        self.proxy_thread.progress_signal.connect(self.proxy_dialog.set_progress)
+        self.proxy_thread.finished_signal.connect(self.on_proxy_finished)
+        self.proxy_thread.start()
+
+        if self.proxy_dialog.exec_() == QDialog.Rejected:
+            self.proxy_thread.stop()
+            self.proxy_thread.wait()
+
+    def on_proxy_finished(self, success, proxy_path):
+        if self.proxy_dialog:
+            self.proxy_dialog.accept()
+
+        if success:
+            time.sleep(0.5)
+
+            if os.path.exists(proxy_path) and os.path.getsize(proxy_path) > 1000:
+                msg = create_dark_msg_box(
+                    self, "Успех", "Proxy создан!", QMessageBox.Information
+                )
+                msg.exec_()
+
+                self.thread.load_video(self.thread.engine.original_path, try_proxy=True)
+
+                if self.current_frame > 0:
+                    self.seek_video(self.current_frame)
+
+                self.lbl_proxy_status.setText("🚀 PROXY АКТИВЕН")
+                self.lbl_proxy_status.setStyleSheet("color: #0f0; font-weight: bold;")
+                self.btn_create_proxy_manual.hide()
+            else:
+                msg = create_dark_msg_box(
+                    self,
+                    "Ошибка",
+                    "Файл прокси пуст или недоступен.\nЗагружаю оригинал.",
+                    QMessageBox.Warning,
+                )
+                msg.exec_()
+                self.thread.load_video(
+                    self.thread.engine.original_path, try_proxy=False
+                )
+        else:
+            msg = create_dark_msg_box(
+                self, "Инфо", "Загружаю оригинал.", QMessageBox.Information
+            )
+            msg.exec_()
+            self.thread.load_video(self.thread.engine.original_path, try_proxy=False)
+            if self.current_frame > 0:
+                self.seek_video(self.current_frame)
 
     def reset_session_data(self):
         self.playing = False
@@ -1047,7 +879,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.redo_stack = []
         self.btn_undo.setEnabled(False)
         self.btn_redo.setEnabled(False)
-
         self.merge_buffer = []
         self.is_merge_mode = False
         self.current_frame = 0
@@ -1056,7 +887,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.last_frame = None
         self.video_zoom = 1.0
         self.video_pan = QPointF(0, 0)
-
         self.scrubber.setEnabled(False)
         self.scrubber.setValue(0)
         self.timeline.set_data(0, 30, [], [])
@@ -1069,28 +899,97 @@ class ProSportsAnalyzer(QMainWindow):
         self.list_filters.clear()
         self.timeline_scroll.setEnabled(False)
         self.calculate_stats()
+        self.lbl_proxy_status.setText("")
+        self.btn_create_proxy_manual.hide()
 
-    def load_video(self, path):
-        self.reset_session_data()
-        self.save_state()
-        self.current_ext = os.path.splitext(path)[1]
-        self.thread.load_video(path)
+    def _remap_history_data(self, history_list, ratio):
+        """
+        Проходит по сохраненной истории (Undo/Redo) и пересчитывает
+        кадры под новый FPS
+        """
+        for state in history_list:
+            # Пересчитываем сегменты внутри состояния
+            if "segments" in state:
+                for seg in state["segments"]:
+                    seg["start"] = int(seg["start"] * ratio)
+                    seg["end"] = int(seg["end"] * ratio)
+
+            # Пересчитываем метки внутри состояния
+            if "markers" in state:
+                for mark in state["markers"]:
+                    mark["frame"] = int(mark["frame"] * ratio)
 
     def set_video_info(self, info):
         self.fps = info["fps"]
         self.total_frames = info["total"]
-        self.segments = [{"start": 0, "end": self.total_frames}]
-        self.markers = []
 
+        # ВОССТАНОВЛЕНИЕ ДАННЫХ ЕСЛИ ЕСТЬ БУФЕР
+        if self._temp_state_for_reload:
+            old_fps = self._temp_state_for_reload.get("fps", self.fps)
+
+            # Достаем списки из буфера
+            saved_segments = self._temp_state_for_reload["segments"]
+            saved_markers = self._temp_state_for_reload["markers"]
+            saved_history = self._temp_state_for_reload["history"]
+            saved_redo = self._temp_state_for_reload["redo_stack"]
+
+            # ЛОГИКА ПЕРЕСЧЕТА (REMAP)
+            if abs(self.fps - old_fps) > 0.01 and old_fps > 0:
+                ratio = self.fps / old_fps
+                print(
+                    f"FPS changed: {old_fps:.2f} -> {self.fps:.2f}. Remapping history with ratio {ratio:.5f}"
+                )
+
+                # Пересчет текущего состояния
+                for seg in saved_segments:
+                    seg["start"] = int(seg["start"] * ratio)
+                    seg["end"] = int(seg["end"] * ratio)
+
+                for mark in saved_markers:
+                    mark["frame"] = int(mark["frame"] * ratio)
+
+                # ПЕРЕСЧЕТ ИСТОРИИ И REDO
+                self._remap_history_data(saved_history, ratio)
+                self._remap_history_data(saved_redo, ratio)
+
+            # Применяем данные обратно в приложение
+            self.segments = saved_segments
+            self.markers = saved_markers
+            self.history = saved_history
+            self.redo_stack = saved_redo
+
+            # Восстанавливаем активность кнопок
+            self.btn_undo.setEnabled(len(self.history) > 0)
+            self.btn_redo.setEnabled(len(self.redo_stack) > 0)
+
+            self._temp_state_for_reload = None
+
+        else:
+            # Если файл новый - полный сброс
+            self.segments = [{"start": 0, "end": self.total_frames}]
+            self.markers = []
+            self.history = []
+            self.redo_stack = []
+            self.btn_undo.setEnabled(False)
+            self.btn_redo.setEnabled(False)
+
+        # Дальше код UI (без изменений)
         self.scrubber.setRange(0, self.total_frames - 1)
         self.scrubber.setValue(0)
         self.scrubber.setEnabled(True)
-
         self.timeline.set_data(self.total_frames, self.fps, self.segments, self.markers)
         self.timeline.selected_segment_idx = 0
-
         self.lbl_vid_res.setText(f"Разрешение: {info['width']}x{info['height']}")
         self.lbl_vid_fps.setText(f"FPS: {self.fps:.2f}")
+
+        if info.get("is_proxy", False):
+            self.lbl_proxy_status.setText("🚀 PROXY АКТИВЕН")
+            self.lbl_proxy_status.setStyleSheet("color: #0f0; font-weight: bold;")
+            self.btn_create_proxy_manual.hide()
+        else:
+            self.lbl_proxy_status.setText("🐢 ОРИГИНАЛ")
+            self.lbl_proxy_status.setStyleSheet("color: #fa0; font-weight: bold;")
+            self.btn_create_proxy_manual.show()
 
         self.calculate_stats()
         self.setFocus()
@@ -1106,71 +1005,72 @@ class ProSportsAnalyzer(QMainWindow):
             self.draw_frame(self.last_frame)
 
     def draw_frame(self, frame):
+        if frame is None:
+            return
         h_orig, w_orig, ch = frame.shape
         lbl_w = self.video_label.width()
         lbl_h = self.video_label.height()
-
-        if lbl_w <= 0 or lbl_h <= 0:
+        if lbl_w <= 1 or lbl_h <= 1:
             return
 
         if self.video_zoom > 1.0:
             visible_w = w_orig / self.video_zoom
             visible_h = h_orig / self.video_zoom
-
             cx = w_orig / 2.0 - self.video_pan.x()
             cy = h_orig / 2.0 - self.video_pan.y()
-
             x1 = cx - visible_w / 2.0
             y1 = cy - visible_h / 2.0
             x2 = x1 + visible_w
             y2 = y1 + visible_h
-
             if x1 < 0:
+                x2 -= x1
                 x1 = 0
             if y1 < 0:
+                y2 -= y1
                 y1 = 0
             if x2 > w_orig:
-                x1 = w_orig - visible_w
+                x1 -= x2 - w_orig
+                x2 = w_orig
             if y2 > h_orig:
-                y1 = h_orig - visible_h
-
-            x1, y1 = int(max(0, x1)), int(max(0, y1))
-            x2, y2 = int(min(w_orig, x2)), int(min(h_orig, y2))
-
-            if x2 - x1 < 10 or y2 - y1 < 10:
+                y1 -= y2 - h_orig
+                y2 = h_orig
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2, y2 = min(w_orig, int(x2)), min(h_orig, int(y2))
+            if (x2 - x1) < 2 or (y2 - y1) < 2:
                 cropped = frame
             else:
                 cropped = frame[y1:y2, x1:x2]
-
-            aspect = (x2 - x1) / (y2 - y1) if (y2 - y1) > 0 else 1
-            target_w = lbl_w
-            target_h = int(target_w / aspect)
-            if target_h > lbl_h:
-                target_h = lbl_h
-                target_w = int(target_h * aspect)
-
-            frame_resized = cv2.resize(
-                cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR
-            )
-
         else:
-            aspect = w_orig / h_orig
+            cropped = frame
+
+        src_h, src_w = cropped.shape[:2]
+        if src_w == 0 or src_h == 0:
+            return
+        aspect = src_w / src_h
+        if lbl_w / lbl_h > aspect:
+            target_h = lbl_h
+            target_w = int(lbl_h * aspect)
+        else:
             target_w = lbl_w
-            target_h = int(target_w / aspect)
-            if target_h > lbl_h:
-                target_h = lbl_h
-                target_w = int(target_h * aspect)
+            target_h = int(lbl_w / aspect)
+
+        if self.video_zoom > 3.0:
+            interp = cv2.INTER_NEAREST
+        elif self.video_zoom < 1.0:
+            interp = cv2.INTER_AREA
+        else:
+            interp = cv2.INTER_LINEAR
+
+        try:
             frame_resized = cv2.resize(
-                frame, (target_w, target_h), interpolation=cv2.INTER_AREA
+                cropped, (target_w, target_h), interpolation=interp
             )
+        except cv2.error:
+            return
 
         rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
         qimg = QImage(
-            rgb.data,
-            frame_resized.shape[1],
-            frame_resized.shape[0],
-            rgb.strides[0],
-            QImage.Format_RGB888,
+            rgb.data, target_w, target_h, rgb.strides[0], QImage.Format_RGB888
         )
         pixmap = QPixmap.fromImage(qimg)
 
@@ -1189,10 +1089,10 @@ class ProSportsAnalyzer(QMainWindow):
                 box_x = pixmap.width() - (text_w + pad * 2) - 20
                 box_y = 20
                 painter.setBrush(QBrush(QColor(m["color"])))
+                painter.setPen(Qt.white)
                 painter.drawRoundedRect(
                     box_x, box_y, text_w + pad * 2, text_h + pad, 5, 5
                 )
-                painter.setPen(Qt.white)
                 painter.drawText(
                     QRect(box_x, box_y, text_w + pad * 2, text_h + pad),
                     Qt.AlignCenter,
@@ -1203,17 +1103,74 @@ class ProSportsAnalyzer(QMainWindow):
         if not self.playing and not self.is_merge_mode:
             self.draw_overlay_text(painter, "⏸ ПАУЗА", 20, 20)
 
-        if self.video_zoom > 1.05:
-            z_txt = f"ZOOM: {self.video_zoom:.1f}x"
+        if self.video_zoom > 1.01:
             self.draw_overlay_text(
-                painter, z_txt, 20, pixmap.height() - 50, bg_alpha=100
+                painter,
+                f"ZOOM: {self.video_zoom:.1f}x",
+                20,
+                pixmap.height() - 50,
+                bg_alpha=100,
             )
 
-        painter.end()
+        from video_engine import IS_DEBUG
 
+        if IS_DEBUG:
+            self.draw_debug_overlay(painter, pixmap.width(), pixmap.height())
+
+        painter.end()
         self.video_label.setPixmap(pixmap)
         self.timeline.set_current_frame(self.current_frame)
         self.calculate_stats()
+
+    def draw_debug_overlay(self, painter, w, h):
+        # Рисуем полосу внизу экрана
+        bar_h = 20
+        y = h - bar_h - 10
+        margin = 50
+        bar_w = w - 2 * margin
+
+        # Фон полосы
+        painter.setBrush(QColor(0, 0, 0, 150))
+        painter.setPen(Qt.NoPen)
+        painter.drawRect(margin, y, bar_w, bar_h)
+
+        # Центр полосы - это текущий кадр
+        # Показываем диапазон +/- 60 кадров от текущего
+        range_val = 60
+        center_x = margin + bar_w / 2
+
+        # Доступ к движку
+        eng = self.thread.engine
+
+        # Рисуем кадры
+        rect_w = bar_w / (range_val * 2)
+
+        for offset in range(-range_val, range_val):
+            abs_frame = self.current_frame + offset
+            if abs_frame < 0 or abs_frame >= self.total_frames:
+                continue
+
+            x = center_x + offset * rect_w
+
+            # Проверка наличия в кэше (словарь cache_index_map остался)
+            if abs_frame in eng.cache_index_map:
+                painter.setBrush(QColor(0, 255, 0, 200))  # Зеленый = есть в кэше
+            else:
+                painter.setBrush(QColor(255, 0, 0, 100))  # Красный = нет (пусто)
+
+            painter.drawRect(int(x), y, int(rect_w) + 1, bar_h)
+
+        # Рисуем центральную риску (текущий кадр)
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawLine(int(center_x), y - 5, int(center_x), y + bar_h + 5)
+
+        # Текст
+        painter.setPen(Qt.white)
+        font = QFont("Arial", 10)
+        painter.setFont(font)
+
+        # Информация о размере кэша
+        painter.drawText(margin, y - 10, f"Cache: {len(eng.cache)}/{eng.CACHE_SIZE}")
 
     def draw_overlay_text(self, painter, text, x, y, bg_alpha=150):
         font = QFont("Segoe UI", 16, QFont.Bold)
@@ -1227,11 +1184,11 @@ class ProSportsAnalyzer(QMainWindow):
         painter.setPen(Qt.white)
         painter.drawText(QRect(x, y, w, h), Qt.AlignCenter, text)
 
+    @undoable
     def add_mark(self):
         for m in self.markers:
             if m["frame"] == self.current_frame:
                 return
-        self.save_state()
         new_marker = {
             "frame": self.current_frame,
             "color": self.current_marker_color,
@@ -1245,11 +1202,8 @@ class ProSportsAnalyzer(QMainWindow):
         self.calculate_stats()
         self.redraw_current_frame()
 
+    @stop_playback
     def split_segment(self):
-        if self.playing:
-            self.playing = False
-            self.thread.stop()
-            self.redraw_current_frame()
         if self.is_merge_mode:
             return
         idx = -1
@@ -1257,14 +1211,12 @@ class ProSportsAnalyzer(QMainWindow):
             if seg["start"] <= self.current_frame < seg["end"]:
                 idx = i
                 break
-
         if idx != -1:
             dlg = SplitDialog(self)
             if dlg.exec_() == QDialog.Accepted:
                 self.save_state()
                 old = self.segments[idx]
                 mid = self.current_frame
-
                 if dlg.choice == "left":
                     s1 = {"start": old["start"], "end": mid + 1}
                     s2 = {"start": mid + 1, "end": old["end"]}
@@ -1273,9 +1225,13 @@ class ProSportsAnalyzer(QMainWindow):
                     s2 = {"start": mid, "end": old["end"]}
 
                 if s1["end"] <= s1["start"] or s2["end"] <= s2["start"]:
-                    QMessageBox.warning(
-                        self, "Ошибка", "Нельзя разрезать на самом краю!"
+                    msg = create_dark_msg_box(
+                        self,
+                        "Ошибка",
+                        "Нельзя разрезать на самом краю!",
+                        QMessageBox.Warning,
                     )
+                    msg.exec_()
                 else:
                     self.segments.pop(idx)
                     self.segments.insert(idx, s2)
@@ -1287,8 +1243,8 @@ class ProSportsAnalyzer(QMainWindow):
                     self.calculate_stats()
             self.setFocus()
 
+    @undoable
     def delete_selection(self):
-        self.save_state()
         if self.timeline.selected_marker_idx != -1:
             self.markers.pop(self.timeline.selected_marker_idx)
             self.timeline.selected_marker_idx = -1
@@ -1307,8 +1263,8 @@ class ProSportsAnalyzer(QMainWindow):
         self.update_ui_marker_controls()
         self.redraw_current_frame()
 
+    @undoable
     def perform_merge(self, i1, i2):
-        self.save_state()
         seg1 = self.segments[i1]
         seg2 = self.segments[i2]
         new_seg = {
@@ -1347,14 +1303,22 @@ class ProSportsAnalyzer(QMainWindow):
             self.merge_buffer.append(idx)
             if len(self.merge_buffer) > 2:
                 self.merge_buffer.pop(0)
+
         self.timeline.merge_candidates = self.merge_buffer
         self.timeline.update()
+
         if len(self.merge_buffer) == 2:
             i1, i2 = sorted(self.merge_buffer)
             if abs(i1 - i2) == 1:
                 self.perform_merge(i1, i2)
             else:
-                QMessageBox.warning(self, "Ошибка", "Можно объединять только соседние!")
+                msg = create_dark_msg_box(
+                    self,
+                    "Ошибка",
+                    "Можно объединять только соседние!",
+                    QMessageBox.Warning,
+                )
+                msg.exec_()
                 self.merge_buffer = []
                 self.timeline.merge_candidates = []
                 self.timeline.update()
@@ -1371,7 +1335,6 @@ class ProSportsAnalyzer(QMainWindow):
 
         idx = self.timeline.selected_segment_idx
         if self.timeline.selected_marker_idx != -1:
-            # MARKER SELECTED
             if self.timeline.selected_marker_idx < len(self.markers):
                 m = self.markers[self.timeline.selected_marker_idx]
                 self.lbl_info_seg.setText(f"МЕТКА: {m['tag']}")
@@ -1381,16 +1344,12 @@ class ProSportsAnalyzer(QMainWindow):
                 self.lbl_seg_duration.setText("Длит. (всего): -")
                 self.lbl_seg_marks.setText("-")
                 self.lbl_tempo.setText("")
-
         elif idx != -1 and idx < len(self.segments):
-            # SEGMENT SELECTED
             seg = self.segments[idx]
             s, e = seg["start"], seg["end"]
-
             is_inside = s <= self.current_frame <= e
             rel_f = self.current_frame - s
             rel_t = rel_f / self.fps if self.fps > 0 else 0
-
             if is_inside:
                 color_style_time = "color: #00ffff; font-weight: bold;"
                 color_style_frame = "color: #e0e0e0;"
@@ -1399,7 +1358,6 @@ class ProSportsAnalyzer(QMainWindow):
                 color_style_time = "color: #777;"
                 color_style_frame = "color: #777;"
                 suffix = " (вне)"
-
             k = e - s
             dur = k / self.fps if self.fps > 0 else 0
             vis_marks = [
@@ -1420,7 +1378,6 @@ class ProSportsAnalyzer(QMainWindow):
             self.lbl_seg_marks.setText(f"Метки (отр): {n}")
             self.lbl_tempo.setText(f"SPM: {tempo:.1f}")
         else:
-            # NO SELECTION
             self.lbl_info_seg.setText("Нет выбора")
             self.lbl_rel_frame.setText("Кадр (отр): -")
             self.lbl_rel_time.setText("Время (отр): -")
@@ -1435,7 +1392,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.thread.stop()
 
     def toggle_play(self):
-        if not self.thread.cap or self.is_merge_mode:
+        if not self.thread.engine.cap or self.is_merge_mode:
             return
         self.playing = not self.playing
         if self.playing:
@@ -1456,8 +1413,8 @@ class ProSportsAnalyzer(QMainWindow):
         self.thread.seek(frame)
         self.calculate_stats()
 
+    @stop_playback
     def step_frame(self, step):
-        self.playing = False
         self.thread.stop()
         n = self.current_frame + step
         if 0 <= n < self.total_frames:
@@ -1524,6 +1481,16 @@ class ProSportsAnalyzer(QMainWindow):
         }
         return cyr_to_lat.get(key_code, key_code)
 
+    def mousePressEvent(self, event):
+        # Если кликнули в пустое место окна, сбрасываем фокус с текстовых полей
+        focused_widget = QApplication.focusWidget()
+        if isinstance(focused_widget, QLineEdit) or isinstance(
+            focused_widget, QDoubleSpinBox
+        ):
+            focused_widget.clearFocus()
+            self.setFocus()  # Возвращаем управление горячим клавишам
+        super().mousePressEvent(event)
+
     def keyPressEvent(self, event: QKeyEvent):
         if self.is_merge_mode:
             return super().keyPressEvent(event)
@@ -1539,9 +1506,7 @@ class ProSportsAnalyzer(QMainWindow):
             return
 
         norm_key = self.normalize_key(raw_key)
-
         full_code = int(modifiers | norm_key)
-
         hk = self.settings.data["hotkeys"]
 
         if full_code == hk["play_pause"]:
@@ -1593,6 +1558,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.timeline.set_merge_mode(False)
         self.timeline.update()
 
+    @stop_playback
     def show_formulas(self):
         self.formulas_window.show()
 
@@ -1615,6 +1581,11 @@ class ProSportsAnalyzer(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    app_icon = QIcon(get_resource_path("favicon.ico"))
+    app.setWindowIcon(app_icon)
+
     window = ProSportsAnalyzer()
+    window.setWindowIcon(app_icon)
     window.show()
     sys.exit(app.exec_())
