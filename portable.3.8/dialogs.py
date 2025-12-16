@@ -2,6 +2,7 @@
 
 import os
 
+import cv2
 from PySide2.QtCore import Qt
 from PySide2.QtGui import QKeySequence
 from PySide2.QtWidgets import (
@@ -209,10 +210,13 @@ class HotkeyEditor(QDialog):
 
 
 class GeneralSettingsDialog(QDialog):
-    def __init__(self, parent, settings_manager, current_proxy_path=None):
+    def __init__(
+        self, parent, settings_manager, current_proxy_path=None, current_video_path=None
+    ):
         super().__init__(parent)
         self.settings = settings_manager
         self.current_proxy_path = current_proxy_path
+        self.current_video_path = current_video_path
         self.setWindowTitle("Настройки")
         self.resize(500, 650)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
@@ -224,6 +228,7 @@ class GeneralSettingsDialog(QDialog):
         self.old_quality = self.settings.get("proxy_quality", 540)
         self.old_codec = self.settings.get("proxy_codec", "MJPG")
         self.old_backend = self.settings.get("video_backend", "MSMF")
+        self.old_ask_proxy = self.settings.get("ask_proxy_creation", True)
 
         self.init_ui()
 
@@ -231,7 +236,7 @@ class GeneralSettingsDialog(QDialog):
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(20)
 
-        # 1. Группа Proxy
+        # Группа Proxy
         gb_proxy = QGroupBox("Настройки Proxy (Оптимизация)")
         form = QFormLayout()
         form.setSpacing(15)
@@ -244,6 +249,13 @@ class GeneralSettingsDialog(QDialog):
         self.cb_use_proxy.setStyleSheet("font-weight: bold; margin-bottom: 5px;")
         self.cb_use_proxy.setCursor(Qt.PointingHandCursor)
         form.addRow(self.cb_use_proxy)
+
+        self.cb_ask_proxy = QCheckBox(
+            "Показывать диалог 'Создать Proxy' при открытии видео"
+        )
+        self.cb_ask_proxy.setChecked(self.settings.get("ask_proxy_creation", True))
+        self.cb_ask_proxy.setCursor(Qt.PointingHandCursor)
+        form.addRow(self.cb_ask_proxy)
 
         # === ВЫБОР КАЧЕСТВА (COMBOBOX) ===
         self.combo_quality = QComboBox()
@@ -308,7 +320,7 @@ class GeneralSettingsDialog(QDialog):
         btn_clear_all.clicked.connect(self.clear_all_proxies)
         main_layout.addWidget(btn_clear_all)
 
-        # 2. Производительность
+        # Производительность
         gb_perf = QGroupBox("Движок и Производительность")
         form2 = QFormLayout()
         form2.setSpacing(15)
@@ -345,7 +357,7 @@ class GeneralSettingsDialog(QDialog):
         self.combo_lookback = QComboBox()
         self.combo_lookback.addItem("Низкая (Быстро, возможны артефакты)", 5)
         self.combo_lookback.addItem("Стандартная (Баланс)", 20)
-        self.combo_lookback.addItem("Высокая (Точно, медленнее seek)", 100)
+        self.combo_lookback.addItem("Высокая (Точно, но намного медленее)", 100)
 
         curr_effort = self.settings.get("seek_effort", 20)
         l_idx = self.combo_lookback.findData(curr_effort)
@@ -374,17 +386,29 @@ class GeneralSettingsDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No,
         )
         if msg.exec_() == QMessageBox.Yes:
+            # Перед удалением нужно освободить видео, если оно открыто в плеере
+            try:
+                # self.parent() возвращает главное окно (ProSportsAnalyzer)
+                main_window = self.parent()
+                if main_window and hasattr(main_window, "thread"):
+                    # Полностью выгружаем видео из памяти и драйвера
+                    main_window.thread.full_release()
+            except Exception as e:
+                print(f"Could not release video before clearing: {e}")
+
             if self.settings.clear_all_proxies():
                 msg_ok = create_dark_msg_box(
                     self, "Успех", "Папка очищена.", QMessageBox.Information
                 )
                 msg_ok.exec_()
+
+                # Устанавливаем флаг, чтобы main.py перезагрузил видео после закрытия окна
                 self.need_restart = True
             else:
                 msg_err = create_dark_msg_box(
                     self,
                     "Ошибка",
-                    "Не удалось удалить некоторые файлы.",
+                    "Не удалось удалить некоторые файлы (возможно, они используются другой программой)",
                     QMessageBox.Warning,
                 )
                 msg_err.exec_()
@@ -394,7 +418,71 @@ class GeneralSettingsDialog(QDialog):
         self.accept()
 
     def apply_settings(self):
+        new_backend: str = self.combo_backend.currentData()
+        old_backend: str = self.settings.get("video_backend", "AUTO")
+
+        # Проверяем только если бэкенд изменился и видео загружено
+        if (
+            new_backend != old_backend
+            and self.current_video_path
+            and os.path.exists(self.current_video_path)
+        ):
+            # Сначала проверяем ОС
+            # Если мы на Linux/Mac, а выбрали Windows-драйвер -> Ошибка
+            if os.name != "nt" and new_backend in ["MSMF", "DSHOW"]:
+                msg = create_dark_msg_box(
+                    self,
+                    "Ошибка",
+                    f"API '{new_backend}' доступен только на Windows.",
+                    QMessageBox.Critical,
+                )
+                msg.exec_()
+                # Возвращаем старое значение
+                idx = self.combo_backend.findData(old_backend)
+                self.combo_backend.setCurrentIndex(idx)
+                return
+
+            # Безопасно получаем константу через getattr.
+            if new_backend == "MSMF":
+                # Если константы нет, вернется CAP_ANY (безопасная заглушка)
+                selected_api = getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)
+            elif new_backend == "DSHOW":
+                selected_api = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
+            elif new_backend == "FFMPEG":
+                selected_api = getattr(cv2, "CAP_FFMPEG", cv2.CAP_ANY)
+            else:
+                selected_api = cv2.CAP_ANY
+
+            # Тест открытия файла
+            try:
+                # Пытаемся открыть видео на миг
+                cap_test = cv2.VideoCapture(self.current_video_path, selected_api)
+                is_ok = cap_test.isOpened()
+                cap_test.release()
+
+                if not is_ok:
+                    msg = create_dark_msg_box(
+                        self,
+                        "Ошибка API",
+                        f"Выбранный движок ({new_backend}) не может открыть текущее видео.\n"
+                        "Изменения отклонены для предотвращения сбоев.",
+                        QMessageBox.Warning,
+                    )
+                    msg.exec_()
+
+                    # Откат настройки в интерфейсе
+                    idx = self.combo_backend.findData(old_backend)
+                    self.combo_backend.setCurrentIndex(idx)
+                    return  # Прерываем сохранение
+
+            except Exception as e:
+                print(f"Validation error: {e}")
+
+        # Если мы дошли сюда, значит всё ок или проверки не требовались, сохраняем
         self.settings.set("use_proxy", self.cb_use_proxy.isChecked())
+
+        ask_proxy = self.cb_ask_proxy.isChecked()
+        self.settings.set("ask_proxy_creation", ask_proxy)
 
         new_q = self.combo_quality.currentData()
         self.settings.set("proxy_quality", new_q)
@@ -405,7 +493,6 @@ class GeneralSettingsDialog(QDialog):
         self.settings.set("cache_size", self.spin_cache.value())
         self.settings.set("use_gpu", self.cb_gpu.isChecked())
 
-        new_backend = self.combo_backend.currentData()
         self.settings.set("video_backend", new_backend)
 
         new_effort = self.combo_lookback.currentData()
@@ -417,6 +504,7 @@ class GeneralSettingsDialog(QDialog):
             new_q != self.old_quality
             or new_codec != self.old_codec
             or new_backend != self.old_backend
+            or ask_proxy != self.old_ask_proxy
         ):
             self.need_restart = True
 

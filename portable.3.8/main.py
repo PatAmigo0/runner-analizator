@@ -254,7 +254,6 @@ class ProSportsAnalyzer(QMainWindow):
         lm.addWidget(QLabel("Список меток:"))
         self.list_filters = QListWidget()
 
-        # --- ИСПРАВЛЕНИЕ: Отключаем выделение строк, оставляем только чекбоксы ---
         self.list_filters.setSelectionMode(QAbstractItemView.NoSelection)
         self.list_filters.setFocusPolicy(Qt.NoFocus)
 
@@ -496,21 +495,31 @@ class ProSportsAnalyzer(QMainWindow):
 
     @stop_playback
     def open_general_settings(self):
-        curr_proxy = getattr(self.thread.engine, "proxy_path", None)
-        if not self.thread.engine.is_proxy_active:
-            curr_proxy = None
+        self.thread.stop()
+        self.thread.wait()
 
-        dlg = GeneralSettingsDialog(self, self.settings, curr_proxy)
+        # Запоминаем состояние ДО открытия диалога
+        eng = self.thread.engine
+        curr_proxy = getattr(eng, "proxy_path", None)
+        original_path = getattr(eng, "original_path", None)
+
+        pre_dialog_state = None
+        current_pos = self.current_frame
+
+        if original_path:
+            pre_dialog_state = self.capture_session_state()
+
+        # Открываем диалог
+        dlg = GeneralSettingsDialog(self, self.settings, curr_proxy, original_path)
         result = dlg.exec_()
 
         if result == QDialog.Accepted:
             self.thread.update_settings_live()
 
-            # Обработка удаления (Приоритет)
-            if dlg.delete_requested and self.thread.engine.original_path:
-                # СОХРАНЯЕМ ДАННЫЕ перед перезагрузкой
-                self._temp_state_for_reload = self.capture_session_state()
-
+            # СЦЕНАРИЙ 1: Удаление конкретного прокси
+            if dlg.delete_requested and original_path:
+                self._temp_state_for_reload = pre_dialog_state
+                # Освобождаем файл перед удалением
                 self.thread.full_release()
 
                 if self.settings.delete_single_proxy(curr_proxy):
@@ -518,45 +527,53 @@ class ProSportsAnalyzer(QMainWindow):
                         self, "Готово", "Прокси удален.", QMessageBox.Information
                     )
                     msg.exec_()
-                    # Загрузка (данные восстановятся в set_video_info)
-                    self.check_and_load_video(self.thread.engine.original_path)
                 else:
                     msg = create_dark_msg_box(
-                        self,
-                        "Ошибка",
-                        "Не удалось удалить файл (возможно заблокирован).",
-                        QMessageBox.Warning,
+                        self, "Ошибка", "Не удалось удалить файл.", QMessageBox.Warning
                     )
                     msg.exec_()
-                    self.check_and_load_video(self.thread.engine.original_path)
+
+                # Перезагружаем (force_proxy=False)
+                self.check_and_load_video(original_path, force_proxy=False)
+                if current_pos > 0:
+                    self.seek_video(current_pos)
                 return
 
-            if dlg.need_restart and self.thread.engine.original_path:
+            # СЦЕНАРИЙ 2: Перезагрузка (или Очистка всех прокси)
+            if dlg.need_restart and original_path:
+                self._temp_state_for_reload = pre_dialog_state
+
                 msg = create_dark_msg_box(
                     self,
                     "Перезагрузка",
-                    "Настройки изменены.\nПерезагрузить видео?",
+                    "Настройки изменены (или файлы очищены).\nПерезагрузить видео?",
                     QMessageBox.Question,
                     QMessageBox.Yes | QMessageBox.No,
                 )
-                if msg.exec_() == QMessageBox.Yes:
-                    # СОХРАНЯЕМ ДАННЫЕ
-                    self._temp_state_for_reload = self.capture_session_state()
 
-                    current_pos = self.current_frame
+                if msg.exec_() == QMessageBox.Yes:
                     if self.settings.get("proxy_quality") != dlg.old_quality:
-                        name, _ = os.path.splitext(
-                            os.path.basename(self.thread.engine.original_path)
-                        )
+                        name, _ = os.path.splitext(os.path.basename(original_path))
                         self.settings.cleanup_old_proxies(name)
 
-                    self.check_and_load_video(self.thread.engine.original_path)
-                    self.seek_video(current_pos)
+                    self.check_and_load_video(original_path)
+                    if current_pos > 0:
+                        self.seek_video(current_pos)
+                else:
+                    # ВАЖНО: Если нажали "НЕТ", но перед этим сделали "Очистить все",
+                    # движок сейчас пустой (cap released). Если не восстановить, будет краш при перерисовке
+                    # Поэтому мы молча восстанавливаем видео, но не меняем настройки
+                    if eng.cap is None or not eng.cap.isOpened():
+                        self.check_and_load_video(original_path)
+                        self.seek_video(current_pos)
 
-            msg = create_dark_msg_box(
-                self, "Инфо", "Настройки применены.", QMessageBox.Information
-            )
-            msg.exec_()
+            # Если ничего критичного не меняли
+            elif not dlg.delete_requested and not dlg.need_restart:
+                msg = create_dark_msg_box(
+                    self, "Инфо", "Настройки сохранены.", QMessageBox.Information
+                )
+                msg.exec_()
+
         self.setFocus()
 
     def closeEvent(self, event):
@@ -729,53 +746,89 @@ class ProSportsAnalyzer(QMainWindow):
         self.setFocus()
 
     def manual_create_proxy(self):
-        if self.thread.engine.original_path:
-            # 1. СОХРАНЯЕМ ДАННЫЕ перед отключением
-            self._temp_state_for_reload = self.capture_session_state()
+        if not self.thread.engine.original_path:
+            return
 
-            self.thread.full_release()
+        path = self.thread.engine.original_path
+        eng = self.thread.engine
+
+        proxy_exists = eng.find_existing_proxy(path)
+        is_active = eng.is_proxy_active
+
+        # СЦЕНАРИЙ 1: Прокси есть, но мы на оригинале -> ПОДКЛЮЧИТЬ
+        if proxy_exists and not is_active:
+            # Запоминаем, где мы были
+            current_pos = self.current_frame
+
+            # ПРИНУДИТЕЛЬНО (force_proxy=True) загружаем прокси
+            self.check_and_load_video(path, try_proxy=True, force_proxy=True)
+
+            # Если подключение прошло успешно, возвращаем ползунок на место
+            if self.thread.engine.is_proxy_active:
+                self.seek_video(current_pos)
+                msg = create_dark_msg_box(
+                    self, "Успех", "Прокси успешно подключен!", QMessageBox.Information
+                )
+                msg.exec_()
+            return
+
+        # СЦЕНАРИЙ 2: Создание нового
+        self._temp_state_for_reload = self.capture_session_state()
+        self.thread.full_release()
+        self.playing = False
+        self.scrubber.setEnabled(False)
+        self.video_label.clear()
+
+        name, _ = os.path.splitext(os.path.basename(path))
+        self.settings.cleanup_old_proxies(name)
+
+        try:
+            qual = self.settings.get("proxy_quality", 540)
+            proxy_path = eng.generate_proxy_path(path, qual)
+        except AttributeError:
+            return
+
+        self.start_proxy_generation(path, proxy_path)
+
+    def check_and_load_video(self, path, try_proxy=True, force_proxy=False):
+        """
+        Главная функция загрузки.
+        force_proxy=True игнорирует глобальную настройку 'use_proxy=False'.
+        """
+        if not self._temp_state_for_reload:
+            self.reset_session_data()
+        else:
             self.playing = False
-
-            self.scrubber.setEnabled(False)
-            self.video_label.clear()
-
-            path = self.thread.engine.original_path
-            name, _ = os.path.splitext(os.path.basename(path))
-
-            self.settings.cleanup_old_proxies(name)
-
-            try:
-                proxy_path = self.thread.engine.get_proxy_filename(path)
-            except AttributeError:
-                qual = self.settings.get("proxy_quality", 540)
-                proxy_path = self.thread.engine.generate_proxy_path(path, qual)
-
-            self.start_proxy_generation(path, proxy_path)
-
-    def check_and_load_video(self, path):
-        # Очищаем текущие данные, НО если это перезагрузка для прокси -
-        # данные уже сохранены в self._temp_state_for_reload
-        self.reset_session_data()
+            self.thread.stop()
+            self.thread.wait()
 
         self.current_ext = os.path.splitext(path)[1]
 
-        # ПРОВЕРЯЕМ ГЛОБАЛЬНУЮ НАСТРОЙКУ
-        use_proxy_setting = self.settings.get("use_proxy", True)
+        use_proxy_global = self.settings.get("use_proxy", True)
+        ask_to_create = self.settings.get("ask_proxy_creation", True)
 
-        if not use_proxy_setting:
-            self.thread.load_video(path, try_proxy=False)
-            return
+        # ЛОГИКА ЗАГРУЗКИ:
+        # Если нажата кнопка вручную (force_proxy) -> Всегда True
+        # Иначе -> (Параметр функции AND Глобальная настройка)
+        if force_proxy:
+            effective_try = True
+        else:
+            effective_try = try_proxy and use_proxy_global
 
-        self.thread.load_video(path, try_proxy=True)
+        self.thread.load_video(path, try_proxy=effective_try)
 
-        if not self.thread.engine.is_proxy_active:
-            try:
-                proxy_path = self.thread.engine.get_proxy_filename(path)
-            except AttributeError:
-                qual = self.settings.get("proxy_quality", 540)
-                proxy_path = self.thread.engine.generate_proxy_path(path, qual)
+        eng = self.thread.engine
 
-            if not os.path.exists(proxy_path):
+        # ЛОГИКА ДИАЛОГА "СОЗДАТЬ ПРОКСИ?":
+        # Срабатывает только если:
+        # 1. Прокси НЕ активен
+        # 2. Мы НЕ в режиме ручного принуждения (force_proxy=False) - чтобы не спамить диалогами при нажатии кнопок
+        # 3. Глобально прокси разрешены
+        # 4. Прокси файла физически нет
+        if not eng.is_proxy_active and not force_proxy and use_proxy_global:
+            proxy_exists = eng.find_existing_proxy(path)
+
+            if not proxy_exists and ask_to_create:
                 msg = create_dark_msg_box(
                     self,
                     "Создание Proxy",
@@ -785,32 +838,19 @@ class ProSportsAnalyzer(QMainWindow):
                 )
                 if msg.exec_() == QMessageBox.Yes:
                     name, _ = os.path.splitext(os.path.basename(path))
+                    if not self._temp_state_for_reload:
+                        self._temp_state_for_reload = self.capture_session_state()
+
                     self.settings.cleanup_old_proxies(name)
+                    qual = self.settings.get("proxy_quality", 540)
+                    gen_path = eng.generate_proxy_path(path, qual)
 
-                    # Сохраняем пустое состояние (или текущее) перед созданием
-                    self._temp_state_for_reload = self.capture_session_state()
-
-                    self.start_proxy_generation(path, proxy_path)
+                    self.start_proxy_generation(path, gen_path)
                     self.thread.stop()
+                    self.update_proxy_ui_status()
                     return
 
-            elif os.path.exists(proxy_path) and os.path.getsize(proxy_path) < 1000:
-                msg = create_dark_msg_box(
-                    self,
-                    "Ошибка Proxy",
-                    "Найден файл прокси, но он поврежден.\nПересоздать?",
-                    QMessageBox.Question,
-                    QMessageBox.Yes | QMessageBox.No,
-                )
-                if msg.exec_() == QMessageBox.Yes:
-                    name, _ = os.path.splitext(os.path.basename(path))
-                    self.settings.cleanup_old_proxies(name)
-
-                    self._temp_state_for_reload = self.capture_session_state()
-
-                    self.start_proxy_generation(path, proxy_path)
-                    self.thread.stop()
-                    return
+        self.update_proxy_ui_status()
 
     def start_proxy_generation(self, input_path, output_path):
         self.proxy_dialog = ProxyProgressDialog(self)
@@ -835,18 +875,23 @@ class ProSportsAnalyzer(QMainWindow):
 
             if os.path.exists(proxy_path) and os.path.getsize(proxy_path) > 1000:
                 msg = create_dark_msg_box(
-                    self, "Успех", "Proxy создан!", QMessageBox.Information
+                    self, "Успех", "Proxy создан и подключен!", QMessageBox.Information
                 )
                 msg.exec_()
 
+                # ПРИНУДИТЕЛЬНО загружаем (force_proxy=True через вызов check_and_load)
+                # Но так как check_and_load сбрасывает данные, а у нас есть _temp_state_for_reload,
+                # лучше вызвать load_video напрямую, но с уверенностью.
+
+                # Самый надежный способ здесь - просто загрузить через thread с флагом.
+                # Движок VideoEngine сам разберется.
                 self.thread.load_video(self.thread.engine.original_path, try_proxy=True)
 
                 if self.current_frame > 0:
                     self.seek_video(self.current_frame)
 
-                self.lbl_proxy_status.setText("🚀 PROXY АКТИВЕН")
-                self.lbl_proxy_status.setStyleSheet("color: #0f0; font-weight: bold;")
-                self.btn_create_proxy_manual.hide()
+                # Принудительно обновляем UI
+                self.update_proxy_ui_status()
             else:
                 msg = create_dark_msg_box(
                     self,
@@ -860,12 +905,17 @@ class ProSportsAnalyzer(QMainWindow):
                 )
         else:
             msg = create_dark_msg_box(
-                self, "Инфо", "Загружаю оригинал.", QMessageBox.Information
+                self,
+                "Инфо",
+                "Операция отменена. Загружаю оригинал.",
+                QMessageBox.Information,
             )
             msg.exec_()
             self.thread.load_video(self.thread.engine.original_path, try_proxy=False)
             if self.current_frame > 0:
                 self.seek_video(self.current_frame)
+
+        self.update_proxy_ui_status()
 
     def reset_session_data(self):
         self.playing = False
@@ -927,20 +977,17 @@ class ProSportsAnalyzer(QMainWindow):
         if self._temp_state_for_reload:
             old_fps = self._temp_state_for_reload.get("fps", self.fps)
 
-            # Достаем списки из буфера
             saved_segments = self._temp_state_for_reload["segments"]
             saved_markers = self._temp_state_for_reload["markers"]
             saved_history = self._temp_state_for_reload["history"]
             saved_redo = self._temp_state_for_reload["redo_stack"]
 
-            # ЛОГИКА ПЕРЕСЧЕТА (REMAP)
             if abs(self.fps - old_fps) > 0.01 and old_fps > 0:
                 ratio = self.fps / old_fps
                 print(
-                    f"FPS changed: {old_fps:.2f} -> {self.fps:.2f}. Remapping history with ratio {ratio:.5f}"
+                    f"FPS changed: {old_fps:.2f} -> {self.fps:.2f}. Remapping history."
                 )
 
-                # Пересчет текущего состояния
                 for seg in saved_segments:
                     seg["start"] = int(seg["start"] * ratio)
                     seg["end"] = int(seg["end"] * ratio)
@@ -948,24 +995,20 @@ class ProSportsAnalyzer(QMainWindow):
                 for mark in saved_markers:
                     mark["frame"] = int(mark["frame"] * ratio)
 
-                # ПЕРЕСЧЕТ ИСТОРИИ И REDO
                 self._remap_history_data(saved_history, ratio)
                 self._remap_history_data(saved_redo, ratio)
 
-            # Применяем данные обратно в приложение
             self.segments = saved_segments
             self.markers = saved_markers
             self.history = saved_history
             self.redo_stack = saved_redo
 
-            # Восстанавливаем активность кнопок
             self.btn_undo.setEnabled(len(self.history) > 0)
             self.btn_redo.setEnabled(len(self.redo_stack) > 0)
 
             self._temp_state_for_reload = None
 
         else:
-            # Если файл новый - полный сброс
             self.segments = [{"start": 0, "end": self.total_frames}]
             self.markers = []
             self.history = []
@@ -973,26 +1016,65 @@ class ProSportsAnalyzer(QMainWindow):
             self.btn_undo.setEnabled(False)
             self.btn_redo.setEnabled(False)
 
-        # Дальше код UI (без изменений)
+        # Блокируем сигналы, чтобы установка значений не вызывала seek_video
+        self.scrubber.blockSignals(True)
         self.scrubber.setRange(0, self.total_frames - 1)
         self.scrubber.setValue(0)
         self.scrubber.setEnabled(True)
+        self.scrubber.blockSignals(False)
+
         self.timeline.set_data(self.total_frames, self.fps, self.segments, self.markers)
         self.timeline.selected_segment_idx = 0
         self.lbl_vid_res.setText(f"Разрешение: {info['width']}x{info['height']}")
         self.lbl_vid_fps.setText(f"FPS: {self.fps:.2f}")
 
-        if info.get("is_proxy", False):
-            self.lbl_proxy_status.setText("🚀 PROXY АКТИВЕН")
-            self.lbl_proxy_status.setStyleSheet("color: #0f0; font-weight: bold;")
-            self.btn_create_proxy_manual.hide()
-        else:
-            self.lbl_proxy_status.setText("🐢 ОРИГИНАЛ")
-            self.lbl_proxy_status.setStyleSheet("color: #fa0; font-weight: bold;")
-            self.btn_create_proxy_manual.show()
-
+        self.update_proxy_ui_status()
         self.calculate_stats()
         self.setFocus()
+
+    def update_proxy_ui_status(self):
+        """Обновляет статус метки и текст кнопки в зависимости от состояния движка."""
+        eng = self.thread.engine
+
+        if not eng.original_path:
+            self.lbl_proxy_status.setText("")
+            self.btn_create_proxy_manual.hide()
+            return
+
+        proxy_exists = eng.find_existing_proxy(eng.original_path)
+
+        # Если прокси сейчас играет
+        if eng.is_proxy_active:
+            self.lbl_proxy_status.setText("🚀 PROXY АКТИВЕН")
+            self.lbl_proxy_status.setStyleSheet("color: #0f0; font-weight: bold;")
+
+            self.btn_create_proxy_manual.setText("⚡ Пересоздать Прокси")
+            self.btn_create_proxy_manual.setStyleSheet(
+                "background-color: #5a7; font-weight: bold; color: #000;"
+            )
+            self.btn_create_proxy_manual.show()
+
+        else:
+            # Если играет оригинал
+            if proxy_exists:
+                self.lbl_proxy_status.setText("🐢 ОРИГИНАЛ (Прокси найден)")
+                self.lbl_proxy_status.setStyleSheet("color: #fa0; font-weight: bold;")
+
+                self.btn_create_proxy_manual.setText("🔗 Подключить Прокси")
+                self.btn_create_proxy_manual.setStyleSheet(
+                    "background-color: #0078d7; font-weight: bold; color: #fff;"
+                )
+                self.btn_create_proxy_manual.show()
+            else:
+                self.lbl_proxy_status.setText("🐢 ОРИГИНАЛ")
+                self.lbl_proxy_status.setStyleSheet("color: #aaa; font-weight: bold;")
+
+                self.btn_create_proxy_manual.setText("⚡ Создать Прокси")
+                self.btn_create_proxy_manual.setStyleSheet(
+                    "background-color: #444; border: 1px solid #666; color: #fff;"
+                )
+
+                self.btn_create_proxy_manual.show()
 
     @Slot(object)
     def update_image(self, frame):
@@ -1415,10 +1497,10 @@ class ProSportsAnalyzer(QMainWindow):
 
     @stop_playback
     def step_frame(self, step):
-        self.thread.stop()
-        n = self.current_frame + step
-        if 0 <= n < self.total_frames:
-            self.thread.seek(n)
+        target = self.current_frame + step
+        if 0 <= target < self.total_frames:
+            # VideoThread сам разберется: если это +1 кадр, он сделает это быстро
+            self.thread.seek(target)
             self.calculate_stats()
 
     def next_segment(self):

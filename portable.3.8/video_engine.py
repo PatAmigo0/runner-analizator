@@ -1,5 +1,6 @@
 # type: ignore
 
+import glob
 import os
 import time
 from collections import deque
@@ -29,7 +30,6 @@ class ProxyGeneratorThread(QThread):
         self._is_running = True
 
     def run(self):
-        # Для генерации прокси используем CAP_ANY (самый надежный для чтения)
         cap = cv2.VideoCapture(self.input_path, cv2.CAP_ANY)
         if not cap.isOpened():
             self.finished_signal.emit(False, "")
@@ -40,7 +40,6 @@ class ProxyGeneratorThread(QThread):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Расчет размеров
         if self.target_height > 0 and height > self.target_height:
             new_height = self.target_height
             ratio = new_height / height
@@ -63,7 +62,6 @@ class ProxyGeneratorThread(QThread):
         if write_fps > 60:
             write_fps = 60
 
-        # Выбор кодека
         if self.codec == "MJPG":
             fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         elif self.codec == "mp4v":
@@ -96,9 +94,6 @@ class ProxyGeneratorThread(QThread):
             ret, frame = cap.read()
             if not ret:
                 break
-
-            # БЕЗОПАСНАЯ ЗАПИСЬ
-            # Защита от сбоев ресайза и битых кадров, чтобы не крашить поток
             try:
                 if new_height != height or new_width != width:
                     resized = cv2.resize(
@@ -109,13 +104,11 @@ class ProxyGeneratorThread(QThread):
                     out.write(frame)
             except Exception as e:
                 debug_log(f"Proxy gen error at frame {count}: {e}")
-                # Просто пропускаем сбойный кадр и идем дальше
 
             count += 1
             if total > 0 and count % 10 == 0:
                 percent = int((count / total) * 100)
                 self.progress_signal.emit(percent)
-
                 if count % 100 == 0:
                     dt = time.time() - start_time
                     if dt > 0:
@@ -162,12 +155,9 @@ class VideoEngine:
         self.cache_index_map = {}
 
         self.smart_seek_lookback = 0
-        self.is_fast_seek = (
-            False  # Флаг: поддерживает ли видео быстрый поиск (MJPG/AVI)
-        )
+        self.is_fast_seek = False
 
     def update_settings_live(self):
-        # 1. Кэш
         new_cache = self.settings.get("cache_size", 100)
         if new_cache != self.CACHE_SIZE:
             self.CACHE_SIZE = new_cache
@@ -180,10 +170,8 @@ class VideoEngine:
             for k in keys_to_del:
                 del self.cache_index_map[k]
 
-        # GPU (применится при следующей загрузке, но сохраняем)
         self.use_gpu = self.settings.get("use_gpu", False)
 
-        # Lookback (применяем мгновенно, если это не MJPG/AVI)
         if not self.is_fast_seek:
             new_effort = self.settings.get("seek_effort", 20)
             if self.smart_seek_lookback != new_effort:
@@ -197,12 +185,9 @@ class VideoEngine:
         self.is_proxy_active = False
         self.proxy_path = ""
 
-        # Логика загрузки прокси
         if try_proxy:
             quality = self.settings.get("proxy_quality", 540)
             expected_proxy = self.generate_proxy_path(path, quality)
-
-            # Проверяем .avi и .mp4
             base, _ = os.path.splitext(expected_proxy)
             candidates = [expected_proxy, base + ".avi", base + ".mp4"]
 
@@ -211,6 +196,17 @@ class VideoEngine:
                 if os.path.exists(cand) and os.path.getsize(cand) > 1000:
                     found_proxy = cand
                     break
+
+            if not found_proxy:
+                filename = os.path.basename(path)
+                name, _ = os.path.splitext(filename)
+                pattern = os.path.join(self.settings.proxies_dir, f"{name}_proxy_*")
+                all_proxies = glob.glob(pattern + ".avi") + glob.glob(pattern + ".mp4")
+                if all_proxies:
+                    for p in all_proxies:
+                        if os.path.getsize(p) > 1000:
+                            found_proxy = p
+                            break
 
             if found_proxy:
                 if self.load_internal(found_proxy):
@@ -224,9 +220,6 @@ class VideoEngine:
 
     def load_internal(self, path):
         self.full_stop()
-
-        # ВЫБОР BACKEND
-        # "AUTO" выбирает cv2.CAP_ANY.
         backend_name = self.settings.get("video_backend", "AUTO")
         backend_map = {
             "MSMF": cv2.CAP_MSMF,
@@ -234,33 +227,21 @@ class VideoEngine:
             "FFMPEG": cv2.CAP_FFMPEG,
             "AUTO": cv2.CAP_ANY,
         }
-
         selected_backend = backend_map.get(backend_name, cv2.CAP_ANY)
-
-        # Защита от выбора Windows-специфичных бэкендов на других ОС
         if os.name != "nt" and selected_backend in [cv2.CAP_MSMF, cv2.CAP_DSHOW]:
             selected_backend = cv2.CAP_ANY
 
-        # Попытка открыть с выбранным бэкендом
         self.cap = cv2.VideoCapture(path, selected_backend)
 
-        # АВТОМАТИЧЕСКИЙ FALLBACK
-        # Если выбрали специфичный бэкенд (DSHOW/MSMF), но файл не открылся - пробуем AUTO
         if not self.cap.isOpened() and selected_backend != cv2.CAP_ANY:
-            debug_log(
-                f"Backend {backend_name} failed to open file. Switching to AUTO (FFMPEG/MSMF)."
-            )
+            debug_log(f"Backend {backend_name} failed. Switching to AUTO.")
             self.cap.release()
             self.cap = cv2.VideoCapture(path, cv2.CAP_ANY)
 
-        # --- GPU УСКОРЕНИЕ ---
-        # Работает в основном с MSMF на Windows 8/10/11
         if self.use_gpu and self.cap.isOpened():
             try:
-                # D3D11 - лучший вариант для Windows 8/10/11
                 self.cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_D3D11)
             except:
-                # Если D3D11 константа недоступна или драйвер не поддерживает
                 pass
 
         if self.cap.isOpened():
@@ -268,13 +249,11 @@ class VideoEngine:
             self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
             if self.fps <= 0:
                 self.fps = 30.0
             if self.total_frames <= 0:
                 self.total_frames = 0
 
-            # ОПРЕДЕЛЕНИЕ КОДЕКА И НАСТРОЙКА LOOKBACK
             try:
                 fourcc_int = int(self.cap.get(cv2.CAP_PROP_FOURCC))
                 fourcc_str = "".join(
@@ -283,10 +262,7 @@ class VideoEngine:
             except:
                 fourcc_str = "UNKNOWN"
 
-            # ЛОГИКА ПРОИЗВОДИТЕЛЬНОСТИ
             user_lookback = self.settings.get("seek_effort", 20)
-
-            # Если это MJPG (Proxy) или просто AVI файл - ищем мгновенно
             if "MJPG" in fourcc_str or path.lower().endswith(".avi"):
                 self.is_fast_seek = True
                 self.smart_seek_lookback = 0
@@ -314,6 +290,26 @@ class VideoEngine:
         qual = self.settings.get("proxy_quality", 540)
         return self.generate_proxy_path(path, qual)
 
+    def find_existing_proxy(self, original_path):
+        if not original_path:
+            return False
+        try:
+            filename = os.path.basename(original_path)
+            name, _ = os.path.splitext(filename)
+            proxies_dir = self.settings.proxies_dir
+            patterns = [
+                os.path.join(proxies_dir, f"{name}_proxy_*.avi"),
+                os.path.join(proxies_dir, f"{name}_proxy_*.mp4"),
+            ]
+            for p in patterns:
+                candidates = glob.glob(p)
+                for c in candidates:
+                    if os.path.exists(c) and os.path.getsize(c) > 1000:
+                        return True
+            return False
+        except:
+            return False
+
     def _update_cache(self, idx, frame):
         if idx not in self.cache_index_map:
             if len(self.cache) == self.cache.maxlen:
@@ -333,8 +329,12 @@ class VideoEngine:
         if ret:
             # -1 потому что read() сдвигает позицию на следующий кадр
             pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
+            if pos < 0:
+                pos = self.current_frame_index + 1
+
             self.current_frame_index = pos
             self._update_cache(pos, frame)
+            # ВОЗВРАЩАЕМ 3 ЗНАЧЕНИЯ!
             return True, frame, pos
         return False, None, self.current_frame_index
 
@@ -344,54 +344,68 @@ class VideoEngine:
 
         target_frame = max(0, min(target_frame, self.total_frames - 1))
 
-        # Сначала ищем в кэше (самое быстрое)
+        # Сначала ищем в кэше
         if target_frame in self.cache_index_map:
             self.current_frame_index = target_frame
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
             return True, self.cache_index_map[target_frame], target_frame
 
-        # Если cap уже стоит перед нужным кадром
-        current_internal = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-        if target_frame == current_internal:
-            return self.read()
+        # ПРОВЕРКА ЛИНЕЙНОГО ЧТЕНИЯ (Оптимизация плавности)
+        diff = target_frame - self.current_frame_index
+        if 0 < diff <= 10:
+            while self.current_frame_index < target_frame:
+                ret, frame, _ = self.read()
+                if not ret:
+                    break
+                if self.current_frame_index == target_frame:
+                    return True, frame, target_frame
 
+            if self.current_frame_index in self.cache_index_map:
+                return (
+                    True,
+                    self.cache_index_map[self.current_frame_index],
+                    self.current_frame_index,
+                )
+
+        # ТЯЖЕЛЫЙ ПОИСК
         t0 = time.time()
 
-        # Умный поиск с учетом кодека
         if self.smart_seek_lookback == 0:
-            # Для MJPG прыгаем прямо в цель
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            # ИСПРАВЛЕНИЕ: распаковываем 3 значения
+            ret, frame, _ = self.read()
+            if ret:
+                return True, frame, self.current_frame_index
         else:
-            # Для MP4 прыгаем назад, чтобы попасть в KeyFrame
+            # Для H.264
             start_fill = max(0, target_frame - self.smart_seek_lookback)
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_fill)
 
-        found_frame = None
+            current_decode_pos = start_fill
+            found_frame = None
 
-        # Читаем кадры, пока не дойдем до цели
-        # Это заполняет кэш "дырами" и обеспечивает плавность декодера
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
+            while current_decode_pos <= target_frame:
+                ret, frame = self.cap.read()
+                if not ret:
+                    break
 
-            curr_pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-            self._update_cache(curr_pos, frame)
+                self._update_cache(current_decode_pos, frame)
+                if current_decode_pos == target_frame:
+                    found_frame = frame
 
-            if curr_pos == target_frame:
-                found_frame = frame
+                current_decode_pos += 1
 
-            # Читаем немного вперед, чтобы буфер заполнился
-            if curr_pos >= target_frame:
-                break
+            if found_frame is not None:
+                self.current_frame_index = target_frame
+                dt = time.time() - t0
+                if dt > 0.1:
+                    debug_log(f"Seek lag: {dt:.3f}s (Target: {target_frame})")
+                return True, found_frame, target_frame
 
-        dt = time.time() - t0
-        if dt > 0.1:
-            debug_log(f"Seek lag: {dt:.3f}s (Target: {target_frame})")
-
-        if found_frame is not None:
-            self.current_frame_index = target_frame
-            return True, found_frame, target_frame
+        # ФОЛЛБЭК
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame, _ = self.read()
+        if ret:
+            return True, frame, target_frame
 
         return False, None, self.current_frame_index
 
