@@ -4,3 +4,4 @@ __pycache__
 main*
 !main.py
 venv_*
+build/
