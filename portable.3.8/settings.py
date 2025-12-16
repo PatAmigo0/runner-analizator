@@ -41,13 +41,13 @@ class SettingsManager:
         self.default_general = {
             "cache_size": 100,
             "use_gpu": False,
-            # Изменили на AUTO, так как на Win8/AVI он работает быстрее
-            "video_backend": "AUTO",  # "AUTO", "MSMF", "DSHOW", "FFMPEG"
-            "seek_effort": 20,  # Глубина поиска ключевого кадра (Lookback)
+            "video_backend": "AUTO",
+            "seek_effort": 20,
             "use_proxy": True,
             "proxy_quality": 540,
-            "proxy_codec": "MJPG",  # "MJPG" (быстро, но большой файл) или "mp4v" (медленно, но маленький)
+            "proxy_codec": "MJPG",
             "last_dir": "",
+            "ask_proxy_creation": True,
         }
 
         self.data = {
@@ -99,53 +99,60 @@ class SettingsManager:
         self.data["general"][key] = value
 
     def get_proxy_extension(self):
-        """Возвращает расширение файла в зависимости от выбранного кодека"""
         codec = self.get("proxy_codec", "MJPG")
         if codec == "MJPG":
-            return ".avi"  # MJPEG лучше всего работает в контейнере AVI
-        return ".mp4"  # mp4v/h264 лучше в MP4
+            return ".avi"
+        return ".mp4"
+
+    def _safe_delete(self, path, retries=5, delay=0.1):
+        """
+        Безопасное удаление файла с повторными попытками
+        Решает проблему блокировки файла Windows (Race Condition)
+        """
+        if not os.path.exists(path):
+            return True
+
+        for i in range(retries):
+            try:
+                os.remove(path)
+                return True  # Удалили успешно, выходим сразу
+            except PermissionError:
+                # Файл занят системой. Ждем и пробуем снова.
+                time.sleep(delay)
+            except OSError as e:
+                print(f"Error deleting {path}: {e}")
+                return False
+
+        print(f"Failed to delete {path} after {retries} retries")
+        return False
 
     def cleanup_old_proxies(self, original_filename_no_ext):
-        """Удаляет ВСЕ старые версии прокси для этого файла (и avi, и mp4)"""
+        """Удаляет старые версии прокси, используя безопасный метод"""
         try:
-            time.sleep(0.1)
-            # Ищем и удаляем файлы с обоими расширениями, чтобы при смене кодека не копился мусор
             extensions = [".mp4", ".avi"]
-
             for ext in extensions:
                 pattern = os.path.join(
                     self.proxies_dir, f"{original_filename_no_ext}_proxy_*{ext}"
                 )
                 for f in glob.glob(pattern):
-                    try:
-                        os.remove(f)
-                    except OSError:
-                        pass
+                    self._safe_delete(f)
         except Exception as e:
             print(f"Cleanup error: {e}")
 
     def clear_all_proxies(self):
         try:
-            time.sleep(0.2)
+            # Убран naked time.sleep(0.2)
+            success = True
             for filename in os.listdir(self.proxies_dir):
                 file_path = os.path.join(self.proxies_dir, filename)
-                try:
-                    if os.path.isfile(file_path) or os.path.islink(file_path):
-                        os.unlink(file_path)
-                except OSError as e:
-                    print(f"File locked: {e}")
-            return True
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    if not self._safe_delete(file_path):
+                        success = False
+            return success
         except Exception as e:
             print(f"Failed to delete proxies: {e}")
             return False
 
     def delete_single_proxy(self, proxy_path):
-        if proxy_path and os.path.exists(proxy_path):
-            for _ in range(5):  # 5 попыток с задержкой
-                try:
-                    os.remove(proxy_path)
-                    return True
-                except OSError:
-                    time.sleep(0.2)
-            print(f"Could not delete {proxy_path}")
-        return False
+        # Используем тот же универсальный безопасный метод
+        return self._safe_delete(proxy_path, retries=10, delay=0.1)
