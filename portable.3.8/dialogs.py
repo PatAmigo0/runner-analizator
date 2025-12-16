@@ -41,7 +41,6 @@ DIALOG_STYLESHEET = """
         margin-top: 22px; 
         font-weight: bold; 
         border-radius: 4px; 
-        /* Отступ сверху чтобы заголовок не перекрывал контент */
         padding-top: 35px; 
         background-color: #252526;
     }
@@ -100,6 +99,11 @@ DIALOG_STYLESHEET = """
         gridline-color: #444;
         border: 1px solid #444;
     }
+    
+    QHeaderView {
+        background-color: #252526;
+        border: none;
+    }
     QHeaderView::section {
         background-color: #333;
         color: #ddd;
@@ -107,6 +111,11 @@ DIALOG_STYLESHEET = """
         border: 1px solid #444;
         font-weight: bold;
     }
+    QTableCornerButton::section {
+        background-color: #333;
+        border: 1px solid #444;
+    }
+
     QCheckBox { spacing: 8px; color: #eee; }
     QCheckBox::indicator { width: 18px; height: 18px; border: 1px solid #555; background: #1e1e1e; }
     QCheckBox::indicator:checked { background: #0078d7; border-color: #0078d7; }
@@ -186,23 +195,71 @@ class HotkeyEditor(QDialog):
     def start_recording(self, index):
         self.recording_key = self.table.item(index.row(), 0).data(Qt.UserRole)
         self.table.item(index.row(), 1).setText("Нажмите клавишу...")
-        self.table.setFocus()
+        # FIX: Захватываем клавиатуру, чтобы таблица не воровала нажатия
+        self.grabKeyboard()
+
+    def normalize_key(self, key_code):
+        """Конвертирует кириллические коды клавиш в стандартные латинские"""
+        cyr_to_lat = {
+            1049: Qt.Key_Q,
+            1062: Qt.Key_W,
+            1059: Qt.Key_E,
+            1050: Qt.Key_R,
+            1045: Qt.Key_T,
+            1053: Qt.Key_Y,
+            1043: Qt.Key_U,
+            1064: Qt.Key_I,
+            1065: Qt.Key_O,
+            1047: Qt.Key_P,
+            1061: Qt.Key_BracketLeft,
+            1066: Qt.Key_BracketRight,
+            1060: Qt.Key_A,
+            1067: Qt.Key_S,
+            1099: Qt.Key_S,
+            1042: Qt.Key_D,
+            1040: Qt.Key_F,
+            1055: Qt.Key_G,
+            1056: Qt.Key_H,
+            1054: Qt.Key_J,
+            1051: Qt.Key_K,
+            1044: Qt.Key_L,
+            1046: Qt.Key_Semicolon,
+            1069: Qt.Key_Apostrophe,
+            1071: Qt.Key_Z,
+            1063: Qt.Key_X,
+            1057: Qt.Key_C,
+            1052: Qt.Key_V,
+            1048: Qt.Key_B,
+            1058: Qt.Key_N,
+            1068: Qt.Key_M,
+            1041: Qt.Key_Comma,
+            1070: Qt.Key_Period,
+        }
+        return cyr_to_lat.get(key_code, key_code)
 
     def keyPressEvent(self, event):
         if self.recording_key:
-            key = event.key()
-            if key == Qt.Key_Escape:
+            raw_key = event.key()
+            if raw_key == Qt.Key_Escape:
+                self.releaseKeyboard()  # FIX: Освобождаем клавиатуру
                 self.refresh_table()
                 self.recording_key = None
                 return
 
-            modifiers = event.modifiers()
-            if key in [Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta]:
+            # Игнорируем нажатия только модификаторов (Ctrl, Shift и т.д.)
+            if raw_key in [Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta]:
                 return
+
+            modifiers = event.modifiers()
+
+            # FIX: Нормализуем клавишу (чтобы работало на русской раскладке при сохранении)
+            key = self.normalize_key(raw_key)
 
             val = int(modifiers | key)
             self.hotkeys[self.recording_key] = val
             self.modified = True
+
+            self.releaseKeyboard()  # FIX: Освобождаем клавиатуру
             self.recording_key = None
             self.refresh_table()
         else:
