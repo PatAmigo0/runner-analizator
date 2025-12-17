@@ -4,7 +4,7 @@ import os
 
 import cv2
 from PySide2.QtCore import Qt
-from PySide2.QtGui import QKeySequence
+from PySide2.QtGui import QKeySequence, QShowEvent
 from PySide2.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,7 +18,6 @@ from PySide2.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -56,10 +55,11 @@ DIALOG_STYLESHEET = """
     QPushButton { 
         background-color: #3a3a3a; 
         border: 1px solid #555; 
-        padding: 6px 12px; 
+        padding: 8px 16px; 
         color: white; 
         border-radius: 3px; 
         min-width: 70px;
+        font-weight: bold;
     }
     QPushButton:hover { background-color: #505050; border-color: #777; }
     QPushButton:pressed { background-color: #0078d7; border-color: #0078d7; }
@@ -195,11 +195,9 @@ class HotkeyEditor(QDialog):
     def start_recording(self, index):
         self.recording_key = self.table.item(index.row(), 0).data(Qt.UserRole)
         self.table.item(index.row(), 1).setText("Нажмите клавишу...")
-        # FIX: Захватываем клавиатуру, чтобы таблица не воровала нажатия
         self.grabKeyboard()
 
     def normalize_key(self, key_code):
-        """Конвертирует кириллические коды клавиш в стандартные латинские"""
         cyr_to_lat = {
             1049: Qt.Key_Q,
             1062: Qt.Key_W,
@@ -241,25 +239,22 @@ class HotkeyEditor(QDialog):
         if self.recording_key:
             raw_key = event.key()
             if raw_key == Qt.Key_Escape:
-                self.releaseKeyboard()  # FIX: Освобождаем клавиатуру
+                self.releaseKeyboard()
                 self.refresh_table()
                 self.recording_key = None
                 return
 
-            # Игнорируем нажатия только модификаторов (Ctrl, Shift и т.д.)
             if raw_key in [Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta]:
                 return
 
             modifiers = event.modifiers()
-
-            # FIX: Нормализуем клавишу (чтобы работало на русской раскладке при сохранении)
             key = self.normalize_key(raw_key)
 
             val = int(modifiers | key)
             self.hotkeys[self.recording_key] = val
             self.modified = True
 
-            self.releaseKeyboard()  # FIX: Освобождаем клавиатуру
+            self.releaseKeyboard()
             self.recording_key = None
             self.refresh_table()
         else:
@@ -293,11 +288,9 @@ class GeneralSettingsDialog(QDialog):
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(20)
 
-        # Группа Proxy
         gb_proxy = QGroupBox("Настройки Proxy (Оптимизация)")
         form = QFormLayout()
         form.setSpacing(15)
-        # Отступ внутри GroupBox чтобы не перекрывался чекбокс
         form.setContentsMargins(15, 35, 15, 15)
         form.setLabelAlignment(Qt.AlignLeft)
 
@@ -314,9 +307,7 @@ class GeneralSettingsDialog(QDialog):
         self.cb_ask_proxy.setCursor(Qt.PointingHandCursor)
         form.addRow(self.cb_ask_proxy)
 
-        # === ВЫБОР КАЧЕСТВА (COMBOBOX) ===
         self.combo_quality = QComboBox()
-        # Данные: (Текст, Значение высоты)
         qualities = [
             ("240p (Ultra Fast)", 240),
             ("360p (Very Fast)", 360),
@@ -327,7 +318,7 @@ class GeneralSettingsDialog(QDialog):
         ]
 
         current_q = self.settings.get("proxy_quality", 540)
-        selected_idx = 3  # Default 540p
+        selected_idx = 3
 
         for i, (text, val) in enumerate(qualities):
             self.combo_quality.addItem(text, val)
@@ -337,7 +328,6 @@ class GeneralSettingsDialog(QDialog):
         self.combo_quality.setCurrentIndex(selected_idx)
         form.addRow("Качество:", self.combo_quality)
 
-        # Кодек
         self.combo_codec = QComboBox()
         self.combo_codec.addItem("MJPG (Быстрый, AVI) - Рекомендуется", "MJPG")
         self.combo_codec.addItem("mp4v (Компактный, MP4)", "mp4v")
@@ -360,10 +350,8 @@ class GeneralSettingsDialog(QDialog):
         gb_proxy.setLayout(form)
         main_layout.addWidget(gb_proxy)
 
-        # Кнопки управления файлами
         if self.current_proxy_path and os.path.exists(self.current_proxy_path):
             name = os.path.basename(self.current_proxy_path)
-            # Сокращенный текст
             btn_del = QPushButton("Удалить прокси для тек. видео")
             btn_del.setToolTip(f"Файл: {name}")
             btn_del.setStyleSheet("""
@@ -377,7 +365,6 @@ class GeneralSettingsDialog(QDialog):
         btn_clear_all.clicked.connect(self.clear_all_proxies)
         main_layout.addWidget(btn_clear_all)
 
-        # Производительность
         gb_perf = QGroupBox("Движок и Производительность")
         form2 = QFormLayout()
         form2.setSpacing(15)
@@ -394,9 +381,7 @@ class GeneralSettingsDialog(QDialog):
         self.cb_gpu.setCursor(Qt.PointingHandCursor)
         form2.addRow(self.cb_gpu)
 
-        # Backend Selector
         self.combo_backend = QComboBox()
-        # "AUTO" обычно это CAP_ANY
         self.combo_backend.addItem("Авто (По умолчанию)", "AUTO")
         self.combo_backend.addItem("Microsoft Media Foundation (Win 8/10/11)", "MSMF")
         self.combo_backend.addItem("DirectShow (Совместимость)", "DSHOW")
@@ -407,10 +392,9 @@ class GeneralSettingsDialog(QDialog):
         if b_idx >= 0:
             self.combo_backend.setCurrentIndex(b_idx)
         else:
-            self.combo_backend.setCurrentIndex(1)  # Default MSMF
+            self.combo_backend.setCurrentIndex(1)
         form2.addRow("API Видео (Backend):", self.combo_backend)
 
-        # Seek Lookback
         self.combo_lookback = QComboBox()
         self.combo_lookback.addItem("Низкая (Быстро, возможны артефакты)", 5)
         self.combo_lookback.addItem("Стандартная (Баланс)", 20)
@@ -443,12 +427,9 @@ class GeneralSettingsDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No,
         )
         if msg.exec_() == QMessageBox.Yes:
-            # Перед удалением нужно освободить видео, если оно открыто в плеере
             try:
-                # self.parent() возвращает главное окно (ProSportsAnalyzer)
                 main_window = self.parent()
                 if main_window and hasattr(main_window, "thread"):
-                    # Полностью выгружаем видео из памяти и драйвера
                     main_window.thread.full_release()
             except Exception as e:
                 print(f"Could not release video before clearing: {e}")
@@ -458,8 +439,6 @@ class GeneralSettingsDialog(QDialog):
                     self, "Успех", "Папка очищена.", QMessageBox.Information
                 )
                 msg_ok.exec_()
-
-                # Устанавливаем флаг, чтобы main.py перезагрузил видео после закрытия окна
                 self.need_restart = True
             else:
                 msg_err = create_dark_msg_box(
@@ -478,14 +457,11 @@ class GeneralSettingsDialog(QDialog):
         new_backend: str = self.combo_backend.currentData()
         old_backend: str = self.settings.get("video_backend", "AUTO")
 
-        # Проверяем только если бэкенд изменился и видео загружено
         if (
             new_backend != old_backend
             and self.current_video_path
             and os.path.exists(self.current_video_path)
         ):
-            # Сначала проверяем ОС
-            # Если мы на Linux/Mac, а выбрали Windows-драйвер -> Ошибка
             if os.name != "nt" and new_backend in ["MSMF", "DSHOW"]:
                 msg = create_dark_msg_box(
                     self,
@@ -494,14 +470,11 @@ class GeneralSettingsDialog(QDialog):
                     QMessageBox.Critical,
                 )
                 msg.exec_()
-                # Возвращаем старое значение
                 idx = self.combo_backend.findData(old_backend)
                 self.combo_backend.setCurrentIndex(idx)
                 return
 
-            # Безопасно получаем константу через getattr.
             if new_backend == "MSMF":
-                # Если константы нет, вернется CAP_ANY (безопасная заглушка)
                 selected_api = getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)
             elif new_backend == "DSHOW":
                 selected_api = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
@@ -510,9 +483,7 @@ class GeneralSettingsDialog(QDialog):
             else:
                 selected_api = cv2.CAP_ANY
 
-            # Тест открытия файла
             try:
-                # Пытаемся открыть видео на миг
                 cap_test = cv2.VideoCapture(self.current_video_path, selected_api)
                 is_ok = cap_test.isOpened()
                 cap_test.release()
@@ -526,16 +497,13 @@ class GeneralSettingsDialog(QDialog):
                         QMessageBox.Warning,
                     )
                     msg.exec_()
-
-                    # Откат настройки в интерфейсе
                     idx = self.combo_backend.findData(old_backend)
                     self.combo_backend.setCurrentIndex(idx)
-                    return  # Прерываем сохранение
+                    return
 
             except Exception as e:
                 print(f"Validation error: {e}")
 
-        # Если мы дошли сюда, значит всё ок или проверки не требовались, сохраняем
         self.settings.set("use_proxy", self.cb_use_proxy.isChecked())
 
         ask_proxy = self.cb_ask_proxy.isChecked()
@@ -572,12 +540,21 @@ class SplitDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("Разрезание")
+        # Удаляем контекстную подсказку
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        # Принудительно устанавливаем политику фокуса на окно, чтобы оно ловило нажатия клавиш
+        self.setFocusPolicy(Qt.StrongFocus)
         apply_dark_title_bar(self)
         self.setStyleSheet(DIALOG_STYLESHEET)
-        self.resize(350, 200)
+        self.resize(350, 180)
         self.choice = "left"
         self.init_ui()
+
+    def showEvent(self, event: QShowEvent):
+        # При появлении окна принудительно забираем фокус
+        self.activateWindow()
+        self.setFocus()
+        super().showEvent(event)
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -587,47 +564,52 @@ class SplitDialog(QDialog):
         lbl.setStyleSheet(
             "font-size: 16px; font-weight: bold; margin-bottom: 5px; color: #0078d7;"
         )
+        lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(lbl)
+
+        # Кнопка для выбора ЛЕВОГО отрезка
+        self.btn_left = QPushButton("⬅ Отнести к ЛЕВОМУ (1 или A)")
+        self.btn_left.setMinimumHeight(45)
+        self.btn_left.setCursor(Qt.PointingHandCursor)
+        # ВАЖНО: Отключаем фокус на кнопках, чтобы они не перехватывали клавиши 1/2
+        self.btn_left.setFocusPolicy(Qt.NoFocus)
+        self.btn_left.clicked.connect(self.select_left)
+
+        # Кнопка для выбора ПРАВОГО отрезка
+        self.btn_right = QPushButton("Отнести к ПРАВОМУ (2 или D) ➡")
+        self.btn_right.setMinimumHeight(45)
+        self.btn_right.setCursor(Qt.PointingHandCursor)
+        # ВАЖНО: Отключаем фокус
+        self.btn_right.setFocusPolicy(Qt.NoFocus)
+        self.btn_right.clicked.connect(self.select_right)
+
+        layout.addWidget(self.btn_left)
+        layout.addWidget(self.btn_right)
 
         layout.addSpacing(10)
 
-        self.rb_left = QRadioButton(
-            "Отнести кадр к ЛЕВОМУ отрезку (Клавиша '1' или 'A')"
-        )
-        self.rb_left.setChecked(True)
-        self.rb_left.setCursor(Qt.PointingHandCursor)
+        # Кнопка Отмена
+        self.btn_cancel = QPushButton("Отмена")
+        # Кнопка отмены может иметь фокус
+        self.btn_cancel.clicked.connect(self.reject)
+        layout.addWidget(self.btn_cancel)
 
-        self.rb_right = QRadioButton(
-            "Отнести кадр к ПРАВОМУ отрезку (Клавиша '2' или 'D')"
-        )
-        self.rb_right.setCursor(Qt.PointingHandCursor)
+    def select_left(self):
+        self.choice = "left"
+        self.accept()
 
-        layout.addWidget(self.rb_left)
-        layout.addWidget(self.rb_right)
-        layout.addStretch()
-
-        bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bbox.accepted.connect(self.on_accept)
-        bbox.rejected.connect(self.reject)
-        layout.addWidget(bbox)
-
-        bbox.button(QDialogButtonBox.Ok).setFocus()
+    def select_right(self):
+        self.choice = "right"
+        self.accept()
 
     def keyPressEvent(self, event):
         key = event.key()
         if key in [Qt.Key_1, Qt.Key_A]:
-            self.rb_left.setChecked(True)
+            self.select_left()
         elif key in [Qt.Key_2, Qt.Key_D]:
-            self.rb_right.setChecked(True)
+            self.select_right()
         else:
             super().keyPressEvent(event)
-
-    def on_accept(self):
-        if self.rb_left.isChecked():
-            self.choice = "left"
-        else:
-            self.choice = "right"
-        self.accept()
 
 
 class ProxyProgressDialog(QDialog):
