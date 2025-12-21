@@ -1,5 +1,6 @@
 # type: ignore
 
+import gc  # [FIX] Added for garbage collection
 import glob
 import os
 import time
@@ -13,7 +14,7 @@ IS_DEBUG = "__compiled__" not in globals()
 
 def debug_log(msg):
     if IS_DEBUG:
-        print(f"[ENGINE] {time.time() % 100:.3f}: {msg}")
+        print(f"[ENGINE] {msg}")
 
 
 # --- PROXY GENERATOR ---
@@ -40,21 +41,20 @@ class ProxyGeneratorThread(QThread):
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        # Расчет размера
         if self.target_height > 0 and height > self.target_height:
             new_height = self.target_height
             ratio = new_height / height
             new_width = int(width * ratio)
-            if new_width % 2 != 0:
-                new_width += 1
-            if new_height % 2 != 0:
-                new_height += 1
         else:
             new_height = height
             new_width = width
-            if new_width % 2 != 0:
-                new_width += 1
-            if new_height % 2 != 0:
-                new_height += 1
+
+        # [FIX] Ensure dimensions are even for codecs
+        if new_width % 2 != 0:
+            new_width += 1
+        if new_height % 2 != 0:
+            new_height += 1
 
         write_fps = round(fps)
         if write_fps <= 0:
@@ -62,12 +62,15 @@ class ProxyGeneratorThread(QThread):
         if write_fps > 60:
             write_fps = 60
 
+        # Выбор FOURCC
         if self.codec == "MJPG":
             fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         elif self.codec == "mp4v":
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         elif self.codec == "avc1":
             fourcc = cv2.VideoWriter_fourcc(*"avc1")
+        elif self.codec == "hevc":
+            fourcc = cv2.VideoWriter_fourcc(*"HEVC")
         else:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 
@@ -75,6 +78,7 @@ class ProxyGeneratorThread(QThread):
             self.output_path, fourcc, write_fps, (new_width, new_height)
         )
 
+        # Fallback, если кодек не открылся
         if not out.isOpened():
             debug_log(f"Codec {self.codec} failed. Fallback to mp4v.")
             root, _ = os.path.splitext(self.output_path)
@@ -221,30 +225,58 @@ class VideoEngine:
     def load_internal(self, path):
         self.full_stop()
         backend_name = self.settings.get("video_backend", "AUTO")
-        backend_map = {
-            "MSMF": cv2.CAP_MSMF,
-            "DSHOW": cv2.CAP_DSHOW,
-            "FFMPEG": cv2.CAP_FFMPEG,
-            "AUTO": cv2.CAP_ANY,
-        }
-        selected_backend = backend_map.get(backend_name, cv2.CAP_ANY)
-        if os.name != "nt" and selected_backend in [cv2.CAP_MSMF, cv2.CAP_DSHOW]:
-            selected_backend = cv2.CAP_ANY
 
-        self.cap = cv2.VideoCapture(path, selected_backend)
+        # Строгий выбор API без fallbacks на этапе инициализации
+        selected_api = cv2.CAP_ANY
+        if backend_name != "AUTO":
+            # Ищем точное совпадение имени константы
+            const_name = f"CAP_{backend_name}"
+            if hasattr(cv2, const_name):
+                selected_api = getattr(cv2, const_name)
+            else:
+                debug_log(
+                    f"WARNING: Backend {backend_name} not found in cv2. Fallback to AUTO."
+                )
+                selected_api = cv2.CAP_ANY
 
-        if not self.cap.isOpened() and selected_backend != cv2.CAP_ANY:
-            debug_log(f"Backend {backend_name} failed. Switching to AUTO.")
-            self.cap.release()
-            self.cap = cv2.VideoCapture(path, cv2.CAP_ANY)
+        debug_log(
+            f"Attempting to open video with API: {backend_name} (Val: {selected_api})"
+        )
 
-        if self.use_gpu and self.cap.isOpened():
-            try:
-                self.cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_D3D11)
-            except:
-                pass
+        self.cap = cv2.VideoCapture(path, selected_api)
+
+        if not self.cap.isOpened():
+            if selected_api != cv2.CAP_ANY:
+                debug_log(
+                    f"Backend {backend_name} failed to open file. Trying AUTO fallback..."
+                )
+                self.cap = cv2.VideoCapture(path, cv2.CAP_ANY)
 
         if self.cap.isOpened():
+            # --- REAL DEBUGGING ---
+            real_backend = self.cap.getBackendName()
+            debug_log(
+                f"SUCCESS: Video opened. Requested: {backend_name} -> Actual: {real_backend}"
+            )
+
+            # --- ЛОГИКА АППАРАТНОГО УСКОРЕНИЯ ---
+            if self.use_gpu:
+                backends_to_try = []
+                if hasattr(cv2, "VIDEO_ACCELERATION_D3D11"):
+                    backends_to_try.append(cv2.VIDEO_ACCELERATION_D3D11)
+                if hasattr(cv2, "VIDEO_ACCELERATION_CUDA"):
+                    backends_to_try.append(cv2.VIDEO_ACCELERATION_CUDA)
+                if hasattr(cv2, "VIDEO_ACCELERATION_MFX"):
+                    backends_to_try.append(cv2.VIDEO_ACCELERATION_MFX)
+                if hasattr(cv2, "VIDEO_ACCELERATION_ANY"):
+                    backends_to_try.append(cv2.VIDEO_ACCELERATION_ANY)
+
+                for backend in backends_to_try:
+                    self.cap.set(cv2.CAP_PROP_HW_ACCELERATION, backend)
+                    val = self.cap.get(cv2.CAP_PROP_HW_ACCELERATION)
+                    if int(val) == backend:
+                        break
+
             self.fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -266,18 +298,20 @@ class VideoEngine:
             if "MJPG" in fourcc_str or path.lower().endswith(".avi"):
                 self.is_fast_seek = True
                 self.smart_seek_lookback = 0
-                debug_log(f"Codec {fourcc_str}: FAST SEEK ENABLED (Lookback=0)")
             else:
                 self.is_fast_seek = False
                 self.smart_seek_lookback = user_lookback
-                debug_log(
-                    f"Codec {fourcc_str}: COMPRESSED (Lookback={self.smart_seek_lookback})"
-                )
+
+            debug_log(
+                f"Info: {self.width}x{self.height} @ {self.fps:.2f}fps, Codec: {fourcc_str}"
+            )
 
             self.current_frame_index = -1
             self.cache.clear()
             self.cache_index_map.clear()
             return True
+
+        debug_log("CRITICAL: Failed to open video with any backend.")
         return False
 
     def generate_proxy_path(self, original_path, quality):
@@ -327,14 +361,12 @@ class VideoEngine:
 
         ret, frame = self.cap.read()
         if ret:
-            # -1 потому что read() сдвигает позицию на следующий кадр
             pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
             if pos < 0:
                 pos = self.current_frame_index + 1
 
             self.current_frame_index = pos
             self._update_cache(pos, frame)
-            # ВОЗВРАЩАЕМ 3 ЗНАЧЕНИЯ!
             return True, frame, pos
         return False, None, self.current_frame_index
 
@@ -344,12 +376,10 @@ class VideoEngine:
 
         target_frame = max(0, min(target_frame, self.total_frames - 1))
 
-        # Сначала ищем в кэше
         if target_frame in self.cache_index_map:
             self.current_frame_index = target_frame
             return True, self.cache_index_map[target_frame], target_frame
 
-        # ПРОВЕРКА ЛИНЕЙНОГО ЧТЕНИЯ (Оптимизация плавности)
         diff = target_frame - self.current_frame_index
         if 0 < diff <= 10:
             while self.current_frame_index < target_frame:
@@ -366,17 +396,14 @@ class VideoEngine:
                     self.current_frame_index,
                 )
 
-        # ТЯЖЕЛЫЙ ПОИСК
         t0 = time.time()
 
         if self.smart_seek_lookback == 0:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-            # ИСПРАВЛЕНИЕ: распаковываем 3 значения
             ret, frame, _ = self.read()
             if ret:
                 return True, frame, self.current_frame_index
         else:
-            # Для H.264
             start_fill = max(0, target_frame - self.smart_seek_lookback)
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, start_fill)
 
@@ -401,7 +428,6 @@ class VideoEngine:
                     debug_log(f"Seek lag: {dt:.3f}s (Target: {target_frame})")
                 return True, found_frame, target_frame
 
-        # ФОЛЛБЭК
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
         ret, frame, _ = self.read()
         if ret:
@@ -413,6 +439,8 @@ class VideoEngine:
         if self.cap:
             self.cap.release()
             self.cap = None
+        # Force Garbage Collection to release Windows file locks
+        gc.collect()
 
     def release(self):
         self.full_stop()

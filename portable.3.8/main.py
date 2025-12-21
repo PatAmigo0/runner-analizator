@@ -53,21 +53,22 @@ from utils import (
     apply_dark_title_bar,
     create_dark_msg_box,
     get_resource_path,
+    normalize_key,
     stop_playback,
     undoable,
 )
 from video_engine import IS_DEBUG, ProxyGeneratorThread
 from video_thread import VideoThread
 
-is_exe_version = 0
 if IS_DEBUG:
     import PySide2
 
     dirname = os.path.dirname(PySide2.__file__)
     plugin_path = os.path.join(dirname, "plugins", "platforms")
     os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
-else:
-    is_exe_version = 1
+    os.environ["OPENCV_VIDEOIO_DEBUG"] = "1"
+    os.environ["OPENCV_FFMPEG_DEBUG"] = "1"
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "video_codec;h264_cuvid"
 
 try:
     import ctypes
@@ -82,7 +83,7 @@ class ProSportsAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = SettingsManager()
-        self.setWindowTitle(f"Pro Sports Analyzer v1.7.{is_exe_version}")
+        self.setWindowTitle(f"Pro Sports Analyzer v1.7.{int(not IS_DEBUG)}")
         self.resize(1600, 950)
         self.setAcceptDrops(True)
         apply_dark_title_bar(self)
@@ -159,7 +160,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.proxy_thread = None
         self.proxy_dialog = None
 
-        # БУФЕР ДЛЯ ПЕРЕНОСА ДАННЫХ ПРИ ПЕРЕЗАГРУЗКЕ ВИДЕО
         self._temp_state_for_reload = None
 
         self.thread = VideoThread(self.settings)
@@ -407,8 +407,11 @@ class ProSportsAnalyzer(QMainWindow):
         self.update_ui_marker_controls()
 
     def fix_focus_policies(self):
+        # Используем ClickFocus, чтобы кнопки можно было нажимать мышью,
+        # но они не захватывали фокус при нажатии Tab.
+        # Это более безопасно, чем NoFocus.
         for btn in self.findChildren(QPushButton):
-            btn.setFocusPolicy(Qt.NoFocus)
+            btn.setFocusPolicy(Qt.ClickFocus)
         self.scrubber.setFocusPolicy(Qt.NoFocus)
         self.timeline_scroll.setFocusPolicy(Qt.NoFocus)
         self.setFocus()
@@ -484,7 +487,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.setFocus()
 
     def capture_session_state(self):
-        """Сохраняет текущие данные сессии (метки, сегменты, историю)"""
         return {
             "segments": copy.deepcopy(self.segments),
             "markers": copy.deepcopy(self.markers),
@@ -498,7 +500,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.thread.stop()
         self.thread.wait()
 
-        # Запоминаем состояние ДО открытия диалога
         eng = self.thread.engine
         curr_proxy = getattr(eng, "proxy_path", None)
         original_path = getattr(eng, "original_path", None)
@@ -509,17 +510,14 @@ class ProSportsAnalyzer(QMainWindow):
         if original_path:
             pre_dialog_state = self.capture_session_state()
 
-        # Открываем диалог
         dlg = GeneralSettingsDialog(self, self.settings, curr_proxy, original_path)
         result = dlg.exec_()
 
         if result == QDialog.Accepted:
             self.thread.update_settings_live()
 
-            # СЦЕНАРИЙ 1: Удаление конкретного прокси
             if dlg.delete_requested and original_path:
                 self._temp_state_for_reload = pre_dialog_state
-                # Освобождаем файл перед удалением
                 self.thread.full_release()
 
                 if self.settings.delete_single_proxy(curr_proxy):
@@ -533,13 +531,11 @@ class ProSportsAnalyzer(QMainWindow):
                     )
                     msg.exec_()
 
-                # Перезагружаем (force_proxy=False)
                 self.check_and_load_video(original_path, force_proxy=False)
                 if current_pos > 0:
                     self.seek_video(current_pos)
                 return
 
-            # СЦЕНАРИЙ 2: Перезагрузка (или Очистка всех прокси)
             if dlg.need_restart and original_path:
                 self._temp_state_for_reload = pre_dialog_state
 
@@ -560,14 +556,10 @@ class ProSportsAnalyzer(QMainWindow):
                     if current_pos > 0:
                         self.seek_video(current_pos)
                 else:
-                    # ВАЖНО: Если нажали "НЕТ", но перед этим сделали "Очистить все",
-                    # движок сейчас пустой (cap released). Если не восстановить, будет краш при перерисовке
-                    # Поэтому мы молча восстанавливаем видео, но не меняем настройки
                     if eng.cap is None or not eng.cap.isOpened():
                         self.check_and_load_video(original_path)
                         self.seek_video(current_pos)
 
-            # Если ничего критичного не меняли
             elif not dlg.delete_requested and not dlg.need_restart:
                 msg = create_dark_msg_box(
                     self, "Инфо", "Настройки сохранены.", QMessageBox.Information
@@ -595,7 +587,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.is_undoing = True
         state = self.history.pop()
 
-        # ЗАЩИТА ОТ "ИСЧЕЗНОВЕНИЯ" ТАЙМЛАЙНА
         if not state["segments"] and self.total_frames > 0:
             self.segments = [{"start": 0, "end": self.total_frames}]
         else:
@@ -699,26 +690,21 @@ class ProSportsAnalyzer(QMainWindow):
             )
 
     def update_filter_list(self):
-        # Блокируем сигналы, чтобы добавление элементов не вызывало лишних событий
         self.list_filters.blockSignals(True)
         self.list_filters.clear()
 
-        # Получаем все уникальные теги из данных меток
         tags = sorted(list(set(m["tag"] for m in self.markers)))
 
         for t in tags:
             it = QListWidgetItem(t)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
 
-            # Берем состояние видимости ПРЯМО ИЗ ДАННЫХ
-            # Ищем первую попавшуюся метку с этим тегом и смотрим её visible
             is_visible = True
             for m in self.markers:
                 if m["tag"] == t:
                     is_visible = m.get("visible", True)
                     break
 
-            # Если метка visible=True, ставим галочку
             it.setCheckState(Qt.Checked if is_visible else Qt.Unchecked)
             self.list_filters.addItem(it)
 
@@ -755,15 +741,10 @@ class ProSportsAnalyzer(QMainWindow):
         proxy_exists = eng.find_existing_proxy(path)
         is_active = eng.is_proxy_active
 
-        # СЦЕНАРИЙ 1: Прокси есть, но мы на оригинале -> ПОДКЛЮЧИТЬ
         if proxy_exists and not is_active:
-            # Запоминаем, где мы были
             current_pos = self.current_frame
-
-            # ПРИНУДИТЕЛЬНО (force_proxy=True) загружаем прокси
             self.check_and_load_video(path, try_proxy=True, force_proxy=True)
 
-            # Если подключение прошло успешно, возвращаем ползунок на место
             if self.thread.engine.is_proxy_active:
                 self.seek_video(current_pos)
                 msg = create_dark_msg_box(
@@ -772,7 +753,6 @@ class ProSportsAnalyzer(QMainWindow):
                 msg.exec_()
             return
 
-        # СЦЕНАРИЙ 2: Создание нового
         self._temp_state_for_reload = self.capture_session_state()
         self.thread.full_release()
         self.playing = False
@@ -791,10 +771,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.start_proxy_generation(path, proxy_path)
 
     def check_and_load_video(self, path, try_proxy=True, force_proxy=False):
-        """
-        Главная функция загрузки.
-        force_proxy=True игнорирует глобальную настройку 'use_proxy=False'.
-        """
         if not self._temp_state_for_reload:
             self.reset_session_data()
         else:
@@ -807,9 +783,6 @@ class ProSportsAnalyzer(QMainWindow):
         use_proxy_global = self.settings.get("use_proxy", True)
         ask_to_create = self.settings.get("ask_proxy_creation", True)
 
-        # ЛОГИКА ЗАГРУЗКИ:
-        # Если нажата кнопка вручную (force_proxy) -> Всегда True
-        # Иначе -> (Параметр функции AND Глобальная настройка)
         if force_proxy:
             effective_try = True
         else:
@@ -819,12 +792,6 @@ class ProSportsAnalyzer(QMainWindow):
 
         eng = self.thread.engine
 
-        # ЛОГИКА ДИАЛОГА "СОЗДАТЬ ПРОКСИ?":
-        # Срабатывает только если:
-        # 1. Прокси НЕ активен
-        # 2. Мы НЕ в режиме ручного принуждения (force_proxy=False) - чтобы не спамить диалогами при нажатии кнопок
-        # 3. Глобально прокси разрешены
-        # 4. Прокси файла физически нет
         if not eng.is_proxy_active and not force_proxy and use_proxy_global:
             proxy_exists = eng.find_existing_proxy(path)
 
@@ -879,18 +846,11 @@ class ProSportsAnalyzer(QMainWindow):
                 )
                 msg.exec_()
 
-                # ПРИНУДИТЕЛЬНО загружаем (force_proxy=True через вызов check_and_load)
-                # Но так как check_and_load сбрасывает данные, а у нас есть _temp_state_for_reload,
-                # лучше вызвать load_video напрямую, но с уверенностью.
-
-                # Самый надежный способ здесь - просто загрузить через thread с флагом.
-                # Движок VideoEngine сам разберется.
                 self.thread.load_video(self.thread.engine.original_path, try_proxy=True)
 
                 if self.current_frame > 0:
                     self.seek_video(self.current_frame)
 
-                # Принудительно обновляем UI
                 self.update_proxy_ui_status()
             else:
                 msg = create_dark_msg_box(
@@ -953,27 +913,21 @@ class ProSportsAnalyzer(QMainWindow):
         self.btn_create_proxy_manual.hide()
 
     def _remap_history_data(self, history_list, ratio):
-        """
-        Проходит по сохраненной истории (Undo/Redo) и пересчитывает
-        кадры под новый FPS
-        """
         for state in history_list:
-            # Пересчитываем сегменты внутри состояния
             if "segments" in state:
                 for seg in state["segments"]:
                     seg["start"] = int(seg["start"] * ratio)
                     seg["end"] = int(seg["end"] * ratio)
 
-            # Пересчитываем метки внутри состояния
             if "markers" in state:
                 for mark in state["markers"]:
                     mark["frame"] = int(mark["frame"] * ratio)
 
     def set_video_info(self, info):
+        print(f"[DEBUG] set_video_info called: {info}")
         self.fps = info["fps"]
         self.total_frames = info["total"]
 
-        # ВОССТАНОВЛЕНИЕ ДАННЫХ ЕСЛИ ЕСТЬ БУФЕР
         if self._temp_state_for_reload:
             old_fps = self._temp_state_for_reload.get("fps", self.fps)
 
@@ -982,7 +936,8 @@ class ProSportsAnalyzer(QMainWindow):
             saved_history = self._temp_state_for_reload["history"]
             saved_redo = self._temp_state_for_reload["redo_stack"]
 
-            if abs(self.fps - old_fps) > 0.01 and old_fps > 0:
+            # Prevent drift: Only remap if FPS difference is significant
+            if abs(self.fps - old_fps) > 0.1 and old_fps > 0:
                 ratio = self.fps / old_fps
                 print(
                     f"FPS changed: {old_fps:.2f} -> {self.fps:.2f}. Remapping history."
@@ -1016,7 +971,6 @@ class ProSportsAnalyzer(QMainWindow):
             self.btn_undo.setEnabled(False)
             self.btn_redo.setEnabled(False)
 
-        # Блокируем сигналы, чтобы установка значений не вызывала seek_video
         self.scrubber.blockSignals(True)
         self.scrubber.setRange(0, self.total_frames - 1)
         self.scrubber.setValue(0)
@@ -1033,7 +987,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.setFocus()
 
     def update_proxy_ui_status(self):
-        """Обновляет статус метки и текст кнопки в зависимости от состояния движка."""
         eng = self.thread.engine
 
         if not eng.original_path:
@@ -1043,7 +996,6 @@ class ProSportsAnalyzer(QMainWindow):
 
         proxy_exists = eng.find_existing_proxy(eng.original_path)
 
-        # Если прокси сейчас играет
         if eng.is_proxy_active:
             self.lbl_proxy_status.setText("🚀 PROXY АКТИВЕН")
             self.lbl_proxy_status.setStyleSheet("color: #0f0; font-weight: bold;")
@@ -1055,7 +1007,6 @@ class ProSportsAnalyzer(QMainWindow):
             self.btn_create_proxy_manual.show()
 
         else:
-            # Если играет оригинал
             if proxy_exists:
                 self.lbl_proxy_status.setText("🐢 ОРИГИНАЛ (Прокси найден)")
                 self.lbl_proxy_status.setStyleSheet("color: #fa0; font-weight: bold;")
@@ -1087,6 +1038,7 @@ class ProSportsAnalyzer(QMainWindow):
             self.draw_frame(self.last_frame)
 
     def draw_frame(self, frame):
+        # print("[DEBUG] draw_frame called")
         if frame is None:
             return
         h_orig, w_orig, ch = frame.shape
@@ -1148,14 +1100,27 @@ class ProSportsAnalyzer(QMainWindow):
                 cropped, (target_w, target_h), interpolation=interp
             )
         except cv2.error:
+            print("[DEBUG] cv2.error in resize")
             return
 
+        # print("[DEBUG] converting color")
         rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-        qimg = QImage(
-            rgb.data, target_w, target_h, rgb.strides[0], QImage.Format_RGB888
-        )
+
+        # Safer QImage creation without immediate .copy() on potentially unstable memory
+        # We also explicitly calculate bytesPerLine to avoid Stride mismatch crashes
+        height, width, channel = rgb.shape
+        bytesPerLine = 3 * width
+
+        # print(f"[DEBUG] Creating QImage: {width}x{height}, line={bytesPerLine}")
+
+        # NOTE: We keep a reference to 'rgb' only as long as qimg is needed for conversion
+        # QPixmap.fromImage makes a deep copy into video memory immediately
+        qimg = QImage(rgb.data, width, height, bytesPerLine, QImage.Format_RGB888)
+
+        # print("[DEBUG] Creating Pixmap")
         pixmap = QPixmap.fromImage(qimg)
 
+        # print("[DEBUG] Starting Painter")
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -1197,62 +1162,65 @@ class ProSportsAnalyzer(QMainWindow):
         from video_engine import IS_DEBUG
 
         if IS_DEBUG:
+            # print("[DEBUG] Drawing debug overlay")
             self.draw_debug_overlay(painter, pixmap.width(), pixmap.height())
 
         painter.end()
+        # print("[DEBUG] Setting Pixmap")
         self.video_label.setPixmap(pixmap)
         self.timeline.set_current_frame(self.current_frame)
         self.calculate_stats()
+        # print("[DEBUG] draw_frame finished")
 
     def draw_debug_overlay(self, painter, w, h):
-        # Рисуем полосу внизу экрана
-        bar_h = 20
-        y = h - bar_h - 10
-        margin = 50
-        bar_w = w - 2 * margin
+        # Replaced Mutex Lock with Try/Except
+        # Locking mutex from UI thread while Video thread is running causes deadlocks/crashes
+        try:
+            bar_h = 20
+            y = h - bar_h - 10
+            margin = 50
+            bar_w = w - 2 * margin
 
-        # Фон полосы
-        painter.setBrush(QColor(0, 0, 0, 150))
-        painter.setPen(Qt.NoPen)
-        painter.drawRect(margin, y, bar_w, bar_h)
+            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(margin, y, bar_w, bar_h)
 
-        # Центр полосы - это текущий кадр
-        # Показываем диапазон +/- 60 кадров от текущего
-        range_val = 60
-        center_x = margin + bar_w / 2
+            range_val = 60
+            center_x = margin + bar_w / 2
 
-        # Доступ к движку
-        eng = self.thread.engine
+            eng = self.thread.engine
 
-        # Рисуем кадры
-        rect_w = bar_w / (range_val * 2)
+            rect_w = bar_w / (range_val * 2)
 
-        for offset in range(-range_val, range_val):
-            abs_frame = self.current_frame + offset
-            if abs_frame < 0 or abs_frame >= self.total_frames:
-                continue
+            for offset in range(-range_val, range_val):
+                abs_frame = self.current_frame + offset
+                if abs_frame < 0 or abs_frame >= self.total_frames:
+                    continue
 
-            x = center_x + offset * rect_w
+                x = center_x + offset * rect_w
 
-            # Проверка наличия в кэше (словарь cache_index_map остался)
-            if abs_frame in eng.cache_index_map:
-                painter.setBrush(QColor(0, 255, 0, 200))  # Зеленый = есть в кэше
-            else:
-                painter.setBrush(QColor(255, 0, 0, 100))  # Красный = нет (пусто)
+                if abs_frame in eng.cache_index_map:
+                    painter.setBrush(QColor(0, 255, 0, 200))
+                else:
+                    painter.setBrush(QColor(255, 0, 0, 100))
 
-            painter.drawRect(int(x), y, int(rect_w) + 1, bar_h)
+                painter.drawRect(int(x), y, int(rect_w) + 1, bar_h)
 
-        # Рисуем центральную риску (текущий кадр)
-        painter.setPen(QColor(255, 255, 255))
-        painter.drawLine(int(center_x), y - 5, int(center_x), y + bar_h + 5)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawLine(int(center_x), y - 5, int(center_x), y + bar_h + 5)
 
-        # Текст
-        painter.setPen(Qt.white)
-        font = QFont("Arial", 10)
-        painter.setFont(font)
+            painter.setPen(Qt.white)
+            font = QFont("Arial", 10)
+            painter.setFont(font)
 
-        # Информация о размере кэша
-        painter.drawText(margin, y - 10, f"Cache: {len(eng.cache)}/{eng.CACHE_SIZE}")
+            painter.drawText(
+                margin, y - 10, f"Cache: {len(eng.cache)}/{eng.CACHE_SIZE}"
+            )
+        except RuntimeError:
+            # Dictionary changed size during iteration, just skip this frame's debug
+            pass
+        except Exception as e:
+            print(f"[DEBUG] Overlay error: {e}")
 
     def draw_overlay_text(self, painter, text, x, y, bg_alpha=150):
         font = QFont("Segoe UI", 16, QFont.Bold)
@@ -1420,7 +1388,12 @@ class ProSportsAnalyzer(QMainWindow):
             if self.timeline.selected_marker_idx < len(self.markers):
                 m = self.markers[self.timeline.selected_marker_idx]
                 self.lbl_info_seg.setText(f"МЕТКА: {m['tag']}")
-                self.lbl_rel_time.setText(f"Время: {m['frame'] / self.fps:.3f}s")
+                # [FIX] Protect division by zero
+                if self.fps > 0:
+                    self.lbl_rel_time.setText(f"Время: {m['frame'] / self.fps:.3f}s")
+                else:
+                    self.lbl_rel_time.setText("Время: 0.000s")
+
                 self.lbl_rel_frame.setText(f"Кадр: {m['frame']}")
                 self.lbl_seg_total_frames.setText("Кадров (всего): -")
                 self.lbl_seg_duration.setText("Длит. (всего): -")
@@ -1448,7 +1421,9 @@ class ProSportsAnalyzer(QMainWindow):
                 if s <= m["frame"] <= e and m.get("visible", True)
             ]
             n = len(vis_marks)
-            tempo = (n / dur * 60) if dur > 0 else 0
+
+            # Safe division for tempo
+            tempo = (n / dur * 60) if (dur > 0 and self.fps > 0) else 0
 
             self.lbl_info_seg.setText(f"Отрезок #{idx + 1}")
             self.lbl_rel_frame.setText(f"Кадр (отр): {rel_f}{suffix}")
@@ -1499,7 +1474,6 @@ class ProSportsAnalyzer(QMainWindow):
     def step_frame(self, step):
         target = self.current_frame + step
         if 0 <= target < self.total_frames:
-            # VideoThread сам разберется: если это +1 кадр, он сделает это быстро
             self.thread.seek(target)
             self.calculate_stats()
 
@@ -1525,52 +1499,13 @@ class ProSportsAnalyzer(QMainWindow):
         self.seek_video(self.segments[new_idx]["start"])
         self.calculate_stats()
 
-    def normalize_key(self, key_code):
-        cyr_to_lat = {
-            1049: Qt.Key_Q,
-            1062: Qt.Key_W,
-            1059: Qt.Key_E,
-            1050: Qt.Key_R,
-            1045: Qt.Key_T,
-            1053: Qt.Key_Y,
-            1043: Qt.Key_U,
-            1064: Qt.Key_I,
-            1065: Qt.Key_O,
-            1047: Qt.Key_P,
-            1061: Qt.Key_BracketLeft,
-            1066: Qt.Key_BracketRight,
-            1060: Qt.Key_A,
-            1067: Qt.Key_S,
-            1099: Qt.Key_S,
-            1042: Qt.Key_D,
-            1040: Qt.Key_F,
-            1055: Qt.Key_G,
-            1056: Qt.Key_H,
-            1054: Qt.Key_J,
-            1051: Qt.Key_K,
-            1044: Qt.Key_L,
-            1046: Qt.Key_Semicolon,
-            1069: Qt.Key_Apostrophe,
-            1071: Qt.Key_Z,
-            1063: Qt.Key_X,
-            1057: Qt.Key_C,
-            1052: Qt.Key_V,
-            1048: Qt.Key_B,
-            1058: Qt.Key_N,
-            1068: Qt.Key_M,
-            1041: Qt.Key_Comma,
-            1070: Qt.Key_Period,
-        }
-        return cyr_to_lat.get(key_code, key_code)
-
     def mousePressEvent(self, event):
-        # Если кликнули в пустое место окна, сбрасываем фокус с текстовых полей
         focused_widget = QApplication.focusWidget()
         if isinstance(focused_widget, QLineEdit) or isinstance(
             focused_widget, QDoubleSpinBox
         ):
             focused_widget.clearFocus()
-            self.setFocus()  # Возвращаем управление горячим клавишам
+            self.setFocus()
         super().mousePressEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
@@ -1587,7 +1522,7 @@ class ProSportsAnalyzer(QMainWindow):
                 self.showFullScreen()
             return
 
-        norm_key = self.normalize_key(raw_key)
+        norm_key = normalize_key(raw_key)
         full_code = int(modifiers | norm_key)
         hk = self.settings.data["hotkeys"]
 
