@@ -15,6 +15,7 @@ from PySide2.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -23,7 +24,7 @@ from PySide2.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
 )
-from utils import apply_dark_title_bar, create_dark_msg_box
+from utils import apply_dark_title_bar, create_dark_msg_box, normalize_key
 
 DIALOG_STYLESHEET = """
     QDialog { 
@@ -174,6 +175,10 @@ class HotkeyEditor(QDialog):
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bbox.accepted.connect(self.accept)
         bbox.rejected.connect(self.reject)
+
+        for btn in bbox.buttons():
+            btn.setFocusPolicy(Qt.StrongFocus)
+
         layout.addWidget(bbox)
 
     def refresh_table(self):
@@ -197,44 +202,6 @@ class HotkeyEditor(QDialog):
         self.table.item(index.row(), 1).setText("Нажмите клавишу...")
         self.grabKeyboard()
 
-    def normalize_key(self, key_code):
-        cyr_to_lat = {
-            1049: Qt.Key_Q,
-            1062: Qt.Key_W,
-            1059: Qt.Key_E,
-            1050: Qt.Key_R,
-            1045: Qt.Key_T,
-            1053: Qt.Key_Y,
-            1043: Qt.Key_U,
-            1064: Qt.Key_I,
-            1065: Qt.Key_O,
-            1047: Qt.Key_P,
-            1061: Qt.Key_BracketLeft,
-            1066: Qt.Key_BracketRight,
-            1060: Qt.Key_A,
-            1067: Qt.Key_S,
-            1099: Qt.Key_S,
-            1042: Qt.Key_D,
-            1040: Qt.Key_F,
-            1055: Qt.Key_G,
-            1056: Qt.Key_H,
-            1054: Qt.Key_J,
-            1051: Qt.Key_K,
-            1044: Qt.Key_L,
-            1046: Qt.Key_Semicolon,
-            1069: Qt.Key_Apostrophe,
-            1071: Qt.Key_Z,
-            1063: Qt.Key_X,
-            1057: Qt.Key_C,
-            1052: Qt.Key_V,
-            1048: Qt.Key_B,
-            1058: Qt.Key_N,
-            1068: Qt.Key_M,
-            1041: Qt.Key_Comma,
-            1070: Qt.Key_Period,
-        }
-        return cyr_to_lat.get(key_code, key_code)
-
     def keyPressEvent(self, event):
         if self.recording_key:
             raw_key = event.key()
@@ -248,7 +215,7 @@ class HotkeyEditor(QDialog):
                 return
 
             modifiers = event.modifiers()
-            key = self.normalize_key(raw_key)
+            key = normalize_key(raw_key)
 
             val = int(modifiers | key)
             self.hotkeys[self.recording_key] = val
@@ -270,7 +237,7 @@ class GeneralSettingsDialog(QDialog):
         self.current_proxy_path = current_proxy_path
         self.current_video_path = current_video_path
         self.setWindowTitle("Настройки")
-        self.resize(500, 650)
+        self.resize(550, 750)  # Slightly taller
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         apply_dark_title_bar(self)
         self.setStyleSheet(DIALOG_STYLESHEET)
@@ -307,14 +274,26 @@ class GeneralSettingsDialog(QDialog):
         self.cb_ask_proxy.setCursor(Qt.PointingHandCursor)
         form.addRow(self.cb_ask_proxy)
 
+        # --- NEW PROXY LOCATION LABEL ---
+        lbl_loc = QLabel("Папка хранения:")
+        lbl_loc.setStyleSheet("color: #ccc;")
+
+        self.le_path = QLineEdit(self.settings.proxies_dir)
+        self.le_path.setReadOnly(True)
+        self.le_path.setStyleSheet(
+            "background-color: #333; color: #aaa; border: 1px solid #444;"
+        )
+        form.addRow(lbl_loc, self.le_path)
+        # --------------------------------
+
         self.combo_quality = QComboBox()
         qualities = [
-            ("240p (Ultra Fast)", 240),
-            ("360p (Very Fast)", 360),
-            ("480p (Fast)", 480),
-            ("540p (Balanced)", 540),
-            ("720p (High Quality)", 720),
-            ("1080p (Full HD)", 1080),
+            ("240p", 240),
+            ("360p", 360),
+            ("480p", 480),
+            ("540p", 540),
+            ("720p", 720),
+            ("1080p", 1080),
         ]
 
         current_q = self.settings.get("proxy_quality", 540)
@@ -329,8 +308,10 @@ class GeneralSettingsDialog(QDialog):
         form.addRow("Качество:", self.combo_quality)
 
         self.combo_codec = QComboBox()
-        self.combo_codec.addItem("MJPG (Быстрый, AVI) - Рекомендуется", "MJPG")
-        self.combo_codec.addItem("mp4v (Компактный, MP4)", "mp4v")
+        self.combo_codec.addItem("MJPG", "MJPG")
+        self.combo_codec.addItem("mp4v", "mp4v")
+        self.combo_codec.addItem("H.264", "avc1")
+        self.combo_codec.addItem("H.265 (HEVC)", "hevc")
 
         curr_codec = self.settings.get("proxy_codec", "MJPG")
         idx = self.combo_codec.findData(curr_codec)
@@ -342,7 +323,7 @@ class GeneralSettingsDialog(QDialog):
         form.addRow("Кодек:", self.combo_codec)
 
         lbl_hint = QLabel(
-            "MJPG: Мгновенная перемотка, большой файл.\nmp4v: Маленький файл, возможны лаги при реверсе."
+            "MJPG: Быстрая перемотка, большой файл.\navc1/hevc: Маленький файл, нужен GPU."
         )
         lbl_hint.setStyleSheet("color: #888; font-size: 12px; margin-top: 5px;")
         form.addRow("", lbl_hint)
@@ -359,10 +340,12 @@ class GeneralSettingsDialog(QDialog):
                 QPushButton:hover { background-color: #700000; border-color: #f00; }
             """)
             btn_del.clicked.connect(self.request_delete)
+            btn_del.setFocusPolicy(Qt.StrongFocus)
             main_layout.addWidget(btn_del)
 
         btn_clear_all = QPushButton("Очистить папку Proxies (Все файлы)")
         btn_clear_all.clicked.connect(self.clear_all_proxies)
+        btn_clear_all.setFocusPolicy(Qt.StrongFocus)
         main_layout.addWidget(btn_clear_all)
 
         gb_perf = QGroupBox("Движок и Производительность")
@@ -382,10 +365,13 @@ class GeneralSettingsDialog(QDialog):
         form2.addRow(self.cb_gpu)
 
         self.combo_backend = QComboBox()
-        self.combo_backend.addItem("Авто (По умолчанию)", "AUTO")
-        self.combo_backend.addItem("Microsoft Media Foundation (Win 8/10/11)", "MSMF")
-        self.combo_backend.addItem("DirectShow (Совместимость)", "DSHOW")
-        self.combo_backend.addItem("FFmpeg (Программный)", "FFMPEG")
+        self.combo_backend.addItem("Auto", "AUTO")
+        self.combo_backend.addItem("MSMF (Windows)", "MSMF")
+        self.combo_backend.addItem("DirectShow", "DSHOW")
+        self.combo_backend.addItem("FFmpeg", "FFMPEG")
+        self.combo_backend.addItem("GStreamer", "GSTREAMER")
+        self.combo_backend.addItem("Intel MFX", "INTEL_MFX")
+        self.combo_backend.addItem("CUDA", "CUDA")
 
         curr_backend = self.settings.get("video_backend", "MSMF")
         b_idx = self.combo_backend.findData(curr_backend)
@@ -396,9 +382,9 @@ class GeneralSettingsDialog(QDialog):
         form2.addRow("API Видео (Backend):", self.combo_backend)
 
         self.combo_lookback = QComboBox()
-        self.combo_lookback.addItem("Низкая (Быстро, возможны артефакты)", 5)
+        self.combo_lookback.addItem("Низкая (Быстро)", 5)
         self.combo_lookback.addItem("Стандартная (Баланс)", 20)
-        self.combo_lookback.addItem("Высокая (Точно, но намного медленее)", 100)
+        self.combo_lookback.addItem("Высокая (Точно)", 100)
 
         curr_effort = self.settings.get("seek_effort", 20)
         l_idx = self.combo_lookback.findData(curr_effort)
@@ -416,6 +402,10 @@ class GeneralSettingsDialog(QDialog):
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bbox.accepted.connect(self.apply_settings)
         bbox.rejected.connect(self.reject)
+
+        for btn in bbox.buttons():
+            btn.setFocusPolicy(Qt.StrongFocus)
+
         main_layout.addWidget(bbox)
 
     def clear_all_proxies(self):
@@ -444,7 +434,7 @@ class GeneralSettingsDialog(QDialog):
                 msg_err = create_dark_msg_box(
                     self,
                     "Ошибка",
-                    "Не удалось удалить некоторые файлы (возможно, они используются другой программой)",
+                    "Не удалось удалить некоторые файлы.",
                     QMessageBox.Warning,
                 )
                 msg_err.exec_()
@@ -454,46 +444,72 @@ class GeneralSettingsDialog(QDialog):
         self.accept()
 
     def apply_settings(self):
-        new_backend: str = self.combo_backend.currentData()
+        new_backend_str: str = self.combo_backend.currentData()
         old_backend: str = self.settings.get("video_backend", "AUTO")
 
+        # Если меняем Backend и видео загружено - проверяем, откроется ли оно
         if (
-            new_backend != old_backend
+            new_backend_str != old_backend
             and self.current_video_path
             and os.path.exists(self.current_video_path)
         ):
-            if os.name != "nt" and new_backend in ["MSMF", "DSHOW"]:
-                msg = create_dark_msg_box(
-                    self,
-                    "Ошибка",
-                    f"API '{new_backend}' доступен только на Windows.",
-                    QMessageBox.Critical,
-                )
-                msg.exec_()
-                idx = self.combo_backend.findData(old_backend)
-                self.combo_backend.setCurrentIndex(idx)
-                return
+            # 1. Строгий маппинг строк на имена констант OpenCV
+            # Мы не используем getattr с дефолтом ANY, чтобы избежать самообмана
+            backend_const_name = f"CAP_{new_backend_str}"
 
-            if new_backend == "MSMF":
-                selected_api = getattr(cv2, "CAP_MSMF", cv2.CAP_ANY)
-            elif new_backend == "DSHOW":
-                selected_api = getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY)
-            elif new_backend == "FFMPEG":
-                selected_api = getattr(cv2, "CAP_FFMPEG", cv2.CAP_ANY)
-            else:
+            # Исключение для AUTO
+            if new_backend_str == "AUTO":
                 selected_api = cv2.CAP_ANY
-
-            try:
-                cap_test = cv2.VideoCapture(self.current_video_path, selected_api)
-                is_ok = cap_test.isOpened()
-                cap_test.release()
-
-                if not is_ok:
+            else:
+                # Проверяем, существует ли такая константа в текущем cv2
+                if not hasattr(cv2, backend_const_name):
                     msg = create_dark_msg_box(
                         self,
-                        "Ошибка API",
-                        f"Выбранный движок ({new_backend}) не может открыть текущее видео.\n"
-                        "Изменения отклонены для предотвращения сбоев.",
+                        "Ошибка совместимости",
+                        f"Ваша версия OpenCV не поддерживает движок '{new_backend_str}'.\n"
+                        f"Константа cv2.{backend_const_name} не найдена.",
+                        QMessageBox.Critical,
+                    )
+                    msg.exec_()
+                    # Возврат на старое
+                    idx = self.combo_backend.findData(old_backend)
+                    self.combo_backend.setCurrentIndex(idx)
+                    return
+
+                selected_api = getattr(cv2, backend_const_name)
+
+            # 2. Пробуем открыть
+            try:
+                cap_test = cv2.VideoCapture(self.current_video_path, selected_api)
+                is_opened = cap_test.isOpened()
+
+                # Получаем реальное имя движка, который сработал
+                real_backend = cap_test.getBackendName() if is_opened else "NONE"
+                cap_test.release()
+
+                if not is_opened:
+                    msg = create_dark_msg_box(
+                        self,
+                        "Ошибка открытия",
+                        f"Движок '{new_backend_str}' не смог открыть это видео.",
+                        QMessageBox.Warning,
+                    )
+                    msg.exec_()
+                    idx = self.combo_backend.findData(old_backend)
+                    self.combo_backend.setCurrentIndex(idx)
+                    return
+
+                # 3. ПРОВЕРКА НА ПОДМЕНУ (Silent Fallback)
+                # Если мы просили CUDA, а OpenCV втихую подсунул MSMF/FFMPEG - ругаемся.
+                if (
+                    new_backend_str not in ["AUTO", "ANY"]
+                    and real_backend != new_backend_str
+                ):
+                    msg = create_dark_msg_box(
+                        self,
+                        "Ошибка применения",
+                        f"Вы выбрали '{new_backend_str}', но OpenCV автоматически переключился на '{real_backend}'.\n"
+                        "Скорее всего, у вас не установлены необходимые библиотеки (CUDA/GStreamer) или драйверы.",
                         QMessageBox.Warning,
                     )
                     msg.exec_()
@@ -503,7 +519,11 @@ class GeneralSettingsDialog(QDialog):
 
             except Exception as e:
                 print(f"Validation error: {e}")
+                msg = create_dark_msg_box(self, "Ошибка", str(e), QMessageBox.Critical)
+                msg.exec_()
+                return
 
+        # Если все проверки прошли - сохраняем
         self.settings.set("use_proxy", self.cb_use_proxy.isChecked())
 
         ask_proxy = self.cb_ask_proxy.isChecked()
@@ -518,7 +538,7 @@ class GeneralSettingsDialog(QDialog):
         self.settings.set("cache_size", self.spin_cache.value())
         self.settings.set("use_gpu", self.cb_gpu.isChecked())
 
-        self.settings.set("video_backend", new_backend)
+        self.settings.set("video_backend", new_backend_str)
 
         new_effort = self.combo_lookback.currentData()
         self.settings.set("seek_effort", new_effort)
@@ -528,7 +548,7 @@ class GeneralSettingsDialog(QDialog):
         if (
             new_q != self.old_quality
             or new_codec != self.old_codec
-            or new_backend != self.old_backend
+            or new_backend_str != old_backend
             or ask_proxy != self.old_ask_proxy
         ):
             self.need_restart = True
@@ -540,9 +560,7 @@ class SplitDialog(QDialog):
     def __init__(self, parent):
         super().__init__(parent)
         self.setWindowTitle("Разрезание")
-        # Удаляем контекстную подсказку
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        # Принудительно устанавливаем политику фокуса на окно, чтобы оно ловило нажатия клавиш
         self.setFocusPolicy(Qt.StrongFocus)
         apply_dark_title_bar(self)
         self.setStyleSheet(DIALOG_STYLESHEET)
@@ -551,9 +569,7 @@ class SplitDialog(QDialog):
         self.init_ui()
 
     def showEvent(self, event: QShowEvent):
-        # При появлении окна принудительно забираем фокус
         self.activateWindow()
-        self.setFocus()
         super().showEvent(event)
 
     def init_ui(self):
@@ -567,20 +583,16 @@ class SplitDialog(QDialog):
         lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(lbl)
 
-        # Кнопка для выбора ЛЕВОГО отрезка
-        self.btn_left = QPushButton("⬅ Отнести к ЛЕВОМУ (1 или A)")
+        self.btn_left = QPushButton("Отнести к ЛЕВОМУ (1 или A)")
         self.btn_left.setMinimumHeight(45)
         self.btn_left.setCursor(Qt.PointingHandCursor)
-        # ВАЖНО: Отключаем фокус на кнопках, чтобы они не перехватывали клавиши 1/2
-        self.btn_left.setFocusPolicy(Qt.NoFocus)
+        self.btn_left.setFocusPolicy(Qt.StrongFocus)
         self.btn_left.clicked.connect(self.select_left)
 
-        # Кнопка для выбора ПРАВОГО отрезка
-        self.btn_right = QPushButton("Отнести к ПРАВОМУ (2 или D) ➡")
+        self.btn_right = QPushButton("Отнести к ПРАВОМУ (2 или D)")
         self.btn_right.setMinimumHeight(45)
         self.btn_right.setCursor(Qt.PointingHandCursor)
-        # ВАЖНО: Отключаем фокус
-        self.btn_right.setFocusPolicy(Qt.NoFocus)
+        self.btn_right.setFocusPolicy(Qt.StrongFocus)
         self.btn_right.clicked.connect(self.select_right)
 
         layout.addWidget(self.btn_left)
@@ -588,9 +600,7 @@ class SplitDialog(QDialog):
 
         layout.addSpacing(10)
 
-        # Кнопка Отмена
         self.btn_cancel = QPushButton("Отмена")
-        # Кнопка отмены может иметь фокус
         self.btn_cancel.clicked.connect(self.reject)
         layout.addWidget(self.btn_cancel)
 
@@ -603,7 +613,7 @@ class SplitDialog(QDialog):
         self.accept()
 
     def keyPressEvent(self, event):
-        key = event.key()
+        key = normalize_key(event.key())
         if key in [Qt.Key_1, Qt.Key_A]:
             self.select_left()
         elif key in [Qt.Key_2, Qt.Key_D]:
@@ -657,6 +667,7 @@ class ProxyProgressDialog(QDialog):
         btn = QPushButton("Отмена")
         btn.setFixedSize(100, 30)
         btn.clicked.connect(self.reject)
+        btn.setFocusPolicy(Qt.StrongFocus)
 
         h_layout = QHBoxLayout()
         h_layout.addStretch()

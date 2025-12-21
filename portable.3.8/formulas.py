@@ -37,11 +37,9 @@ class FormulasWindow(QDialog):
         apply_dark_title_bar(self)
         self.init_ui()
 
-        # Загрузка сохраненных формул
         if stored_formulas:
             self.load_from_data(stored_formulas)
         else:
-            # Дефолтная формула
             self.add_row_data("Шаги в минуту (SPM)", "(n / t) * 60")
 
     def init_ui(self):
@@ -130,14 +128,15 @@ class FormulasWindow(QDialog):
                     f["expr"], {"__builtins__": None, "abs": abs, "round": round}, ctx
                 )
                 res_txt += f"✅ {f['name']}: {val:.2f}\n"
-            except Exception:
-                res_txt += f"❌ {f['name']}: Ошибка\n"
+            except ZeroDivisionError:
+                res_txt += f"⚠️ {f['name']}: Деление на 0\n"
+            except Exception as e:
+                res_txt += f"❌ {f['name']}: Ошибка ({e})\n"
 
         res_win = QDialog(self)
         res_win.setWindowTitle("Результат")
         res_win.resize(300, 200)
 
-        # Тоже убираем ? и красим заголовок у окна результата
         res_win.setWindowFlags(res_win.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         apply_dark_title_bar(res_win)
 

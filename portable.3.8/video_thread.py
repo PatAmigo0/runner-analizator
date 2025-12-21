@@ -61,8 +61,12 @@ class VideoThread(QThread):
 
     def run(self):
         self._run_flag = True
+
+        # [FIX] Better sync logic
+        start_playback_time = time.time()
+        frames_played_in_loop = 0
+
         while self._run_flag:
-            st = time.time()
             self.mutex.lock()
             fr_r = False
             fr = None
@@ -84,13 +88,22 @@ class VideoThread(QThread):
                 self.change_pixmap_signal.emit(fr)
 
             if self._run_flag and self.fps > 0:
-                dt = time.time() - st
-                td = 1.0 / (self.fps * self.speed)
-                sl = td - dt
-                if sl > 0:
-                    self.msleep(int(sl * 1000))
-                else:
-                    self.msleep(1)
+                frames_played_in_loop += 1
+
+                # Calculate expected time based on frames played
+                expected_time = frames_played_in_loop / (self.fps * self.speed)
+                actual_time = time.time() - start_playback_time
+
+                # Calculate sleep needed to match expected time
+                sleep_needed = expected_time - actual_time
+
+                # If we are ahead (rendering fast), sleep
+                if sleep_needed > 0:
+                    self.msleep(int(sleep_needed * 1000))
+                # If we are behind by more than 0.2s, reset clock to avoid aggressive catch-up
+                elif sleep_needed < -0.2:
+                    start_playback_time = time.time()
+                    frames_played_in_loop = 0
 
     def stop(self):
         self._run_flag = False

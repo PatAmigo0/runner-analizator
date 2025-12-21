@@ -5,3 +5,5 @@ main*
 !main.py
 venv_*
 build/
+*.exe
+ProSportsAnalyzer.exe

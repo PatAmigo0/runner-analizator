@@ -7,7 +7,6 @@ class TimelineWidget(QWidget):
     seek_requested = Signal(int)
     segment_selected = Signal(int)
     marker_selected = Signal(int)
-    # Сигнал для обновления внешнего скроллбара: (visible_start, visible_length, total_frames)
     view_changed = Signal(int, int, int)
 
     def __init__(self):
@@ -35,9 +34,8 @@ class TimelineWidget(QWidget):
         self.track_height = 50
         self.track_y = 50
 
-        # ZOOM VARIABLES
-        self.view_start = 0.0  # Какой кадр сейчас самый левый на экране
-        self.view_length = 100.0  # Сколько кадров вмещается в экран
+        self.view_start = 0.0
+        self.view_length = 100.0
 
     def set_data(self, total_frames, fps, segments, markers):
         self.total_frames = max(1, total_frames)
@@ -45,7 +43,6 @@ class TimelineWidget(QWidget):
         self.segments = segments
         self.markers = markers
 
-        # Сброс зума при загрузке нового видео
         self.view_start = 0.0
         self.view_length = float(self.total_frames)
 
@@ -55,23 +52,13 @@ class TimelineWidget(QWidget):
     def set_current_frame(self, frame):
         self.current_frame = frame
 
-        # --- AUTO-SCROLL LOGIC ---
-        # Если мы в режиме зума (видим не всё видео)
         if self.view_length < self.total_frames:
-            # Границы видимости
             view_end = self.view_start + self.view_length
-
-            # Если курсор ушел вправо за экран
             if frame >= view_end:
-                # Сдвигаем view_start так, чтобы курсор стал виден (с небольшим отступом справа)
                 self.view_start = frame - self.view_length + (self.view_length * 0.05)
-
-            # Если курсор ушел влево за экран
             elif frame < self.view_start:
-                # Сдвигаем view_start влево
                 self.view_start = frame - (self.view_length * 0.05)
 
-            # Проверка границ (Clamping)
             if self.view_start < 0:
                 self.view_start = 0.0
             if self.view_start + self.view_length > self.total_frames:
@@ -89,7 +76,6 @@ class TimelineWidget(QWidget):
         self.update()
 
     def frame_to_pixel(self, frame):
-        # Маппинг кадра в пиксель с учетом зума
         width = self.width() - (self.margin_left + self.margin_right)
         if self.view_length <= 0:
             return self.margin_left
@@ -98,14 +84,14 @@ class TimelineWidget(QWidget):
         return self.margin_left + ratio * width
 
     def pixel_to_frame(self, x):
-        # Обратный маппинг пикселя в кадр
         width = self.width() - (self.margin_left + self.margin_right)
         if width <= 0:
             return 0
 
         ratio = (x - self.margin_left) / width
         frame = self.view_start + ratio * self.view_length
-        return int(max(0, min(frame, self.total_frames)))
+        # Clamp to total_frames - 1 to avoid IndexError
+        return int(max(0, min(frame, self.total_frames - 1)))
 
     def emit_view_changed(self):
         self.view_changed.emit(
@@ -113,9 +99,7 @@ class TimelineWidget(QWidget):
         )
 
     def set_view_start_from_scrollbar(self, val):
-        # Вызывается из main.py при движении скроллбара
         self.view_start = float(val)
-        # Защита границ
         if self.view_start < 0:
             self.view_start = 0
         if self.view_start + self.view_length > self.total_frames:
@@ -123,37 +107,29 @@ class TimelineWidget(QWidget):
         self.update()
 
     def wheelEvent(self, event):
-        # ZOOM LOGIC
         angle = event.angleDelta().y()
         if angle == 0:
             return
 
-        # Zoom factor
         zoom_factor = 0.9 if angle > 0 else 1.1
 
-        # Mouse position relative to timeline logic
         mx = event.pos().x()
         width = self.width() - (self.margin_left + self.margin_right)
         if width <= 0:
             return
 
-        # 1. Определяем, на каком кадре находится курсор ДО зума
         ratio = (mx - self.margin_left) / width
         cursor_frame = self.view_start + ratio * self.view_length
 
-        # 2. Вычисляем новую длину (view_length)
         new_length = self.view_length * zoom_factor
 
-        # ОГРАНИЧЕНИЯ (Constraints)
         if new_length < 10:
             new_length = 10
         if new_length > self.total_frames:
             new_length = float(self.total_frames)
 
-        # 3. Вычисляем новый view_start так, чтобы cursor_frame остался под мышкой
         new_start = cursor_frame - ratio * new_length
 
-        # 4. Проверка границ (Clamping)
         if new_start < 0:
             new_start = 0
         if new_start + new_length > self.total_frames:
@@ -174,11 +150,9 @@ class TimelineWidget(QWidget):
         bg_color = QColor("#111") if self.merge_mode else QColor("#222")
         painter.fillRect(self.rect(), bg_color)
 
-        # Определяем видимый диапазон кадров для оптимизации
         visible_min = self.view_start - self.view_length * 0.1
         visible_max = self.view_start + self.view_length * 1.1
 
-        # SEGMENTS
         for idx, seg in enumerate(self.segments):
             if seg["end"] < visible_min or seg["start"] > visible_max:
                 continue
@@ -218,7 +192,6 @@ class TimelineWidget(QWidget):
                 painter.setPen(QColor("#fff"))
                 painter.drawText(rect, Qt.AlignCenter, f"S{idx + 1}")
 
-        # MARKERS
         if not self.merge_mode:
             font_tag = QFont("Arial", 9, QFont.Bold)
             painter.setFont(font_tag)
@@ -265,7 +238,6 @@ class TimelineWidget(QWidget):
                     painter.setPen(QColor("#ffffff"))
                     painter.drawText(text_rect, Qt.AlignCenter, letter)
 
-        # PLAYHEAD (рисуем, только если в пределах видимости)
         if visible_min <= self.current_frame <= visible_max:
             cx = self.frame_to_pixel(self.current_frame)
             painter.setPen(QPen(QColor("#00ff00"), 2))
@@ -284,7 +256,6 @@ class TimelineWidget(QWidget):
                         return
             return
 
-        # Markers
         base_y = self.track_y + self.track_height
         if y > base_y - 5:
             for i, m in enumerate(self.markers):
@@ -305,7 +276,6 @@ class TimelineWidget(QWidget):
                         self.segment_selected.emit(-1)
                     return
 
-        # Segments
         if self.track_y <= y <= self.track_y + self.track_height:
             for i, seg in enumerate(self.segments):
                 if seg["start"] <= frame < seg["end"]:
@@ -340,7 +310,6 @@ class TimelineWidget(QWidget):
                 self.marker_selected.emit(self.drag_target_idx)
             return
 
-        # Cursor
         base_y = self.track_y + self.track_height
         if y > base_y - 5:
             for m in self.markers:
