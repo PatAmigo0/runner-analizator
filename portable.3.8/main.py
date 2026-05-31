@@ -49,6 +49,9 @@ from dialogs import (
     ProxyProgressDialog,
     SplitDialog,
 )
+
+# Импортируем созданный DrawingManager
+from drawing_manager import DrawingManager
 from formulas import FormulasWindow
 from settings import SettingsManager
 from timeline import TimelineWidget
@@ -127,9 +130,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.settings = SettingsManager()
         self.setWindowTitle(f"Pro Sports Analyzer v1.7.{int(not IS_DEBUG)}")
 
-        # ОПТИМИЗАЦИЯ ДЛЯ ПРЕДОТВРАЩЕНИЯ СЖАТИЯ ИНТЕРФЕЙСА:
-        # Устанавливаем более компактное, стандартное разрешение окна (1400x820),
-        # чтобы интерфейс никогда не сжимался операционной системой на ноутбуках и ПК.
         self.resize(1400, 820)
         self.setAcceptDrops(True)
         apply_dark_title_bar(self)
@@ -157,7 +157,6 @@ class ProSportsAnalyzer(QMainWindow):
             QProgressBar { border: 1px solid #444; text-align: center; color: white; }
             QProgressBar::chunk { background-color: #0078d7; }
 
-            /* --- СТИЛИ ДЛЯ СКРОЛЛБАРА (ТЕМНЫЙ) --- */
             QScrollBar:horizontal {
                 border: none;
                 background: #1e1e1e;
@@ -206,12 +205,14 @@ class ProSportsAnalyzer(QMainWindow):
         self.proxy_thread = None
         self.proxy_dialog = None
 
-        # Инициализация статических буферов для Zero-Memory-Allocation
         self.bgr_buffer = None
         self.rgb_buffer = None
         self.rgb_buffer_shape = (0, 0, 3)
 
         self._temp_state_for_reload = None
+
+        # Инициализируем DrawingManager
+        self.drawing_manager = DrawingManager()
 
         self.thread = VideoThread(self.settings)
         self.thread.change_pixmap_signal.connect(self.update_image)
@@ -234,7 +235,7 @@ class ProSportsAnalyzer(QMainWindow):
 
         top_layout = QHBoxLayout()
 
-        # Left Panel (Сделана более компактной)
+        # Left Panel
         lp = QWidget()
         lp.setFixedWidth(310)
         ll = QVBoxLayout(lp)
@@ -308,9 +309,7 @@ class ProSportsAnalyzer(QMainWindow):
 
         lm.addWidget(QLabel("Список меток:"))
         self.list_filters = QListWidget()
-        self.list_filters.setFixedHeight(
-            100
-        )  # Ограничиваем высоту для экономии пространства
+        self.list_filters.setFixedHeight(100)
         self.list_filters.setSelectionMode(QAbstractItemView.NoSelection)
         self.list_filters.setFocusPolicy(Qt.NoFocus)
         self.list_filters.itemChanged.connect(self.on_filter_changed)
@@ -364,7 +363,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.video_container.mouseReleaseEvent = self.video_mouse_release
 
         sl = QStackedLayout(self.video_container)
-        # Убираем все скрытые отступы у стэка, чтобы картинка никогда не обрезалась
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setStackingMode(QStackedLayout.StackAll)
 
@@ -442,6 +440,33 @@ class ProSportsAnalyzer(QMainWindow):
         hs.addWidget(self.spin_speed)
         gb_speed.setLayout(hs)
         rl.addWidget(gb_speed)
+
+        # --- ИНТЕРФЕЙС ИНСТРУМЕНТОВ РИСОВАНИЯ ---
+        gb_draw = QGroupBox("Рисование (на паузе)")
+        ld = QVBoxLayout()
+        ld.setSpacing(6)
+
+        self.btn_draw_none = QPushButton("🖱 Обзор / Масштаб")
+        self.btn_draw_line = QPushButton("➖ Начертить линию")
+        self.btn_draw_angle = QPushButton("📐 Найти угол (3 клика)")
+        self.btn_draw_erase = QPushButton("🧹 Стереть элемент")
+        self.btn_draw_clear = QPushButton("🗑 Очистить этот кадр")
+
+        self.btn_draw_none.clicked.connect(lambda: self.set_drawing_tool("none"))
+        self.btn_draw_line.clicked.connect(lambda: self.set_drawing_tool("line"))
+        self.btn_draw_angle.clicked.connect(lambda: self.set_drawing_tool("angle"))
+        self.btn_draw_erase.clicked.connect(lambda: self.set_drawing_tool("erase"))
+        self.btn_draw_clear.clicked.connect(self.clear_drawings_frame)
+
+        ld.addWidget(self.btn_draw_none)
+        ld.addWidget(self.btn_draw_line)
+        ld.addWidget(self.btn_draw_angle)
+        ld.addWidget(self.btn_draw_erase)
+        ld.addWidget(self.btn_draw_clear)
+        gb_draw.setLayout(ld)
+        rl.addWidget(gb_draw)
+
+        self.update_tool_buttons()
         rl.addStretch()
         top_layout.addWidget(rp)
         ml.addLayout(top_layout)
@@ -493,14 +518,47 @@ class ProSportsAnalyzer(QMainWindow):
             self.video_pan = QPointF(0, 0)
         self.redraw_current_frame()
 
+    # --- ПЕРЕХВАТ СОБЫТИЙ МЫШИ ДЛЯ СЕРВИСА РИСОВАНИЯ ---
     def video_mouse_press(self, event):
+        self.setFocus()
+        if self.playing:
+            if event.button() == Qt.LeftButton and self.video_zoom > 1.0:
+                self.dragging_video = True
+                self.last_mouse_pos = event.pos()
+                self.video_container.setCursor(Qt.ClosedHandCursor)
+            return
+
+        if (
+            event.button() == Qt.LeftButton
+            and self.drawing_manager.current_tool != "none"
+        ):
+            p_orig = self.screen_to_original(event.pos())
+            if p_orig:
+                self.drawing_manager.handle_press(self.current_frame, p_orig)
+                self.redraw_current_frame()
+            return
+
         if event.button() == Qt.LeftButton and self.video_zoom > 1.0:
             self.dragging_video = True
             self.last_mouse_pos = event.pos()
             self.video_container.setCursor(Qt.ClosedHandCursor)
-        self.setFocus()
 
     def video_mouse_move(self, event):
+        if self.playing:
+            if self.dragging_video:
+                delta = event.pos() - self.last_mouse_pos
+                self.last_mouse_pos = event.pos()
+                self.video_pan += QPointF(delta.x(), delta.y())
+                self.redraw_current_frame()
+            return
+
+        if self.drawing_manager.current_tool != "none":
+            p_orig = self.screen_to_original(event.pos())
+            if p_orig:
+                self.drawing_manager.handle_move(p_orig)
+            self.redraw_current_frame()
+            return
+
         if self.dragging_video:
             delta = event.pos() - self.last_mouse_pos
             self.last_mouse_pos = event.pos()
@@ -508,8 +566,132 @@ class ProSportsAnalyzer(QMainWindow):
             self.redraw_current_frame()
 
     def video_mouse_release(self, event):
+        if self.playing:
+            self.dragging_video = False
+            self.video_container.setCursor(Qt.ArrowCursor)
+            return
+
+        if (
+            event.button() == Qt.LeftButton
+            and self.drawing_manager.current_tool != "none"
+        ):
+            self.drawing_manager.handle_release(self.current_frame)
+            self.redraw_current_frame()
+            return
+
         self.dragging_video = False
         self.video_container.setCursor(Qt.ArrowCursor)
+
+    # --- МАТЕМАТИКА СОПОСТАВЛЕНИЯ КООРДИНАТ КЛИКОВ И ЗУМА ---
+    def get_video_mapping_params(self):
+        if self.last_frame is None:
+            return None
+        h_orig, w_orig, ch = self.last_frame.shape
+        lbl_w = self.video_label.width()
+        lbl_h = self.video_label.height()
+        if lbl_w <= 1 or lbl_h <= 1:
+            return None
+
+        if self.video_zoom > 1.0:
+            visible_w = w_orig / self.video_zoom
+            visible_h = h_orig / self.video_zoom
+            cx = w_orig / 2.0 - self.video_pan.x()
+            cy = h_orig / 2.0 - self.video_pan.y()
+            x1 = cx - visible_w / 2.0
+            y1 = cy - visible_h / 2.0
+            x2 = x1 + visible_w
+            y2 = y1 + visible_h
+            if x1 < 0:
+                x2 -= x1
+                x1 = 0
+            if y1 < 0:
+                y2 -= y1
+                y1 = 0
+            if x2 > w_orig:
+                x1 -= x2 - w_orig
+                x2 = w_orig
+            if y2 > h_orig:
+                y1 -= y2 - h_orig
+                y2 = h_orig
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2, y2 = min(w_orig, int(x2)), min(h_orig, int(y2))
+            src_w = x2 - x1
+            src_h = y2 - y1
+        else:
+            x1, y1 = 0, 0
+            src_w, src_h = w_orig, h_orig
+
+        aspect = src_w / src_h
+        if lbl_w / lbl_h > aspect:
+            target_h = lbl_h
+            target_w = int(lbl_h * aspect)
+        else:
+            target_w = lbl_w
+            target_h = int(lbl_w / aspect)
+
+        x_offset = (lbl_w - target_w) / 2
+        y_offset = (lbl_h - target_h) / 2
+
+        return {
+            "x1": x1,
+            "y1": y1,
+            "src_w": src_w,
+            "src_h": src_h,
+            "target_w": target_w,
+            "target_h": target_h,
+            "x_offset": x_offset,
+            "y_offset": y_offset,
+        }
+
+    def screen_to_original(self, pos):
+        params = self.get_video_mapping_params()
+        if not params:
+            return None
+        x_pix = pos.x() - params["x_offset"]
+        y_pix = pos.y() - params["y_offset"]
+
+        if 0 <= x_pix <= params["target_w"] and 0 <= y_pix <= params["target_h"]:
+            x_crop = (x_pix / params["target_w"]) * params["src_w"]
+            y_crop = (y_pix / params["target_h"]) * params["src_h"]
+            return (params["x1"] + x_crop, params["y1"] + y_crop)
+        return None
+
+    # --- УПРАВЛЕНИЕ ИНСТРУМЕНТАМИ РИСОВАНИЯ ---
+    def set_drawing_tool(self, tool_name):
+        if self.playing:
+            return
+        self.drawing_manager.set_tool(tool_name)
+        self.update_tool_buttons()
+        self.redraw_current_frame()
+
+    def clear_drawings_frame(self):
+        if self.playing:
+            return
+        self.drawing_manager.clear_frame(self.current_frame)
+        self.redraw_current_frame()
+
+    def update_tool_buttons(self):
+        tool = self.drawing_manager.current_tool
+        self.btn_draw_none.setStyleSheet(
+            "background-color: #0078d7; color: white; font-weight: bold;"
+            if tool == "none"
+            else ""
+        )
+        self.btn_draw_line.setStyleSheet(
+            "background-color: #0078d7; color: white; font-weight: bold;"
+            if tool == "line"
+            else ""
+        )
+        self.btn_draw_angle.setStyleSheet(
+            "background-color: #0078d7; color: white; font-weight: bold;"
+            if tool == "angle"
+            else ""
+        )
+        self.btn_draw_erase.setStyleSheet(
+            "background-color: #0078d7; color: white; font-weight: bold;"
+            if tool == "erase"
+            else ""
+        )
 
     def on_scrubber_change(self, val):
         if hasattr(self, "thread") and (
@@ -535,7 +717,6 @@ class ProSportsAnalyzer(QMainWindow):
         if not self.timeline_scroll.signalsBlocked():
             self.timeline.set_view_start_from_scrollbar(val)
 
-    @stop_playback
     def open_hotkeys_dialog(self):
         dlg = HotkeyEditor(self, self.settings.data["hotkeys"])
         if dlg.exec_() == QDialog.Accepted:
@@ -656,6 +837,7 @@ class ProSportsAnalyzer(QMainWindow):
 
         self.markers = state["markers"]
         self.timeline.set_data(self.total_frames, self.fps, self.segments, self.markers)
+        self.list_filters.clear()
         self.update_filter_list()
         self.calculate_stats()
         self.redraw_current_frame()
@@ -677,6 +859,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.segments = state["segments"]
         self.markers = state["markers"]
         self.timeline.set_data(self.total_frames, self.fps, self.segments, self.markers)
+        self.list_filters.clear()
         self.update_filter_list()
         self.calculate_stats()
         self.redraw_current_frame()
@@ -969,6 +1152,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.calculate_stats()
         self.lbl_proxy_status.setText("")
         self.btn_create_proxy_manual.hide()
+        self.drawing_manager.clear_all()
 
     def _remap_history_data(self, history_list, ratio):
         for state in history_list:
@@ -1102,6 +1286,7 @@ class ProSportsAnalyzer(QMainWindow):
         if lbl_w <= 1 or lbl_h <= 1:
             return
 
+        x1, y1 = 0, 0
         if self.video_zoom > 1.0:
             visible_w = w_orig / self.video_zoom
             visible_h = h_orig / self.video_zoom
@@ -1129,10 +1314,12 @@ class ProSportsAnalyzer(QMainWindow):
                 cropped = frame
             else:
                 cropped = frame[y1:y2, x1:x2]
+            src_w = x2 - x1
+            src_h = y2 - y1
         else:
             cropped = frame
+            src_w, src_h = w_orig, h_orig
 
-        src_h, src_w = cropped.shape[:2]
         if src_w == 0 or src_h == 0:
             return
         aspect = src_w / src_h
@@ -1150,8 +1337,6 @@ class ProSportsAnalyzer(QMainWindow):
         else:
             interp = cv2.INTER_LINEAR
 
-        # --- CONVEYER DOUBLE ZERO-MEMORY-ALLOCATION ---
-        # Инициализируем/реаллоцируем постоянные буферы только при изменении разрешения окна
         if (
             self.rgb_buffer is None
             or self.rgb_buffer_shape[0] != target_h
@@ -1162,19 +1347,15 @@ class ProSportsAnalyzer(QMainWindow):
             self.rgb_buffer_shape = (target_h, target_w, 3)
 
         try:
-            # ОПТИМИЗАЦИЯ: Исправляем перезапись NumPy буферов, всегда переназначая возвращаемый объект.
-            # Изменение разрешения BGR кадра прямиком в bgr_buffer (0 аллокаций)
             self.bgr_buffer = cv2.resize(
                 cropped, (target_w, target_h), dst=self.bgr_buffer, interpolation=interp
             )
-            # Конвертация цвета BGR -> RGB прямиком в rgb_buffer (0 аллокаций). ЭТО ВЕРНЕТ ПРАВИЛЬНЫЕ ЦВЕТА.
             self.rgb_buffer = cv2.cvtColor(
                 self.bgr_buffer, cv2.COLOR_BGR2RGB, dst=self.rgb_buffer
             )
         except cv2.error:
             return
 
-        # Создаем QImage, который ссылается на статичную память, никаких переполнений RAM
         qimg = QImage(
             self.rgb_buffer.data, target_w, target_h, 3 * target_w, QImage.Format_RGB888
         )
@@ -1218,6 +1399,21 @@ class ProSportsAnalyzer(QMainWindow):
                 bg_alpha=100,
             )
 
+        # --- РЕНДЕРИНГ ЭЛЕМЕНТОВ РИСОВАНИЯ ЧЕРЕЗ МЕНЕДЖЕР ---
+        def map_orig_to_pix(x_o, y_o):
+            x_c = x_o - x1
+            y_c = y_o - y1
+            x_p = (x_c / src_w) * target_w
+            y_p = (y_c / src_h) * target_h
+            return (x_p, y_p)
+
+        current_mouse_screen = self.video_container.mapFromGlobal(self.cursor().pos())
+        current_mouse_orig = self.screen_to_original(current_mouse_screen)
+
+        self.drawing_manager.draw_on_painter(
+            painter, self.current_frame, map_orig_to_pix, current_mouse_orig
+        )
+
         from video_engine import IS_DEBUG
 
         if IS_DEBUG:
@@ -1245,7 +1441,6 @@ class ProSportsAnalyzer(QMainWindow):
             eng = self.thread.engine
             rect_w = bar_w / (range_val * 2)
 
-            # Безопасное чтение ключей из кэша (0 фризов, 0 ошибок RuntimeError)
             cached_keys = eng.get_cached_set()
 
             for offset in range(-range_val, range_val):
@@ -1504,7 +1699,11 @@ class ProSportsAnalyzer(QMainWindow):
         ) or self.is_merge_mode:
             return
         self.playing = not self.playing
-        # Используем современное переключение состояния фонового плеера вместо перезапуска QThread
+
+        # Если запускаем воспроизведение — переводим рисование в дефолтный режим
+        if self.playing:
+            self.set_drawing_tool("none")
+
         self.thread.set_playing(self.playing)
         if not self.playing:
             self.redraw_current_frame()
@@ -1655,4 +1854,5 @@ if __name__ == "__main__":
     window = ProSportsAnalyzer()
     window.setWindowIcon(app_icon)
     window.show()
+    # Запуск через exec_() для обратной совместимости с PySide2 / Python 3.8
     sys.exit(app.exec_())
