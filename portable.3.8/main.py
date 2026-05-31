@@ -4,16 +4,10 @@ import copy
 import os
 import sys
 import time
-import traceback  # Импорт для трассировки ошибок
+import traceback
 
 import cv2
-from dialogs import (
-    GeneralSettingsDialog,
-    HotkeyEditor,
-    ProxyProgressDialog,
-    SplitDialog,
-)
-from formulas import FormulasWindow
+import numpy as np
 from PySide2.QtCore import QPointF, QRect, Qt, Slot
 from PySide2.QtGui import (
     QBrush,
@@ -48,6 +42,14 @@ from PySide2.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from dialogs import (
+    GeneralSettingsDialog,
+    HotkeyEditor,
+    ProxyProgressDialog,
+    SplitDialog,
+)
+from formulas import FormulasWindow
 from settings import SettingsManager
 from timeline import TimelineWidget
 from utils import (
@@ -82,10 +84,6 @@ except ImportError:
 
 # --- ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ОШИБОК ---
 def global_exception_hook(exctype, value, tb):
-    """
-    Перехватывает любые необработанные ошибки и показывает их в окне
-    Работает даже в скомпилированном exe
-    """
     error_msg = "".join(traceback.format_exception(exctype, value, tb))
     print("CRITICAL ERROR:", error_msg)
 
@@ -203,6 +201,10 @@ class ProSportsAnalyzer(QMainWindow):
         self.current_marker_tag = "Main"
         self.proxy_thread = None
         self.proxy_dialog = None
+
+        # Инициализация статических буферов для Zero-Memory-Allocation
+        self.rgb_buffer = None
+        self.rgb_buffer_shape = (0, 0, 3)
 
         self._temp_state_for_reload = None
 
@@ -431,7 +433,10 @@ class ProSportsAnalyzer(QMainWindow):
         self.scrubber = QSlider(Qt.Horizontal)
         self.scrubber.setRange(0, 100)
         self.scrubber.setEnabled(False)
-        self.scrubber.valueChanged.connect(self.on_scrubber_change)
+
+        # Оптимизация: Используем sliderMoved вместо valueChanged, чтобы избежать тормозов при перетаскивании
+        self.scrubber.sliderMoved.connect(self.on_scrubber_change)
+
         ml.addWidget(self.scrubber)
 
         self.timeline = TimelineWidget()
@@ -450,27 +455,9 @@ class ProSportsAnalyzer(QMainWindow):
         self.fix_focus_policies()
         self.update_ui_marker_controls()
 
-        # ПОКАЗАТЬ, КУДА ПИШУТСЯ ЛОГИ ПРИ СТАРТЕ
-        self.show_log_path_info()
-
-    def show_log_path_info(self):
-        # Только если это скомпилированная версия
-        if not IS_DEBUG:
-            try:
-                msg = QMessageBox(self)
-                msg.setWindowTitle("Info")
-                msg.setText(f"Файл логов находится здесь:\n{logger.log_path}")
-                msg.setIcon(QMessageBox.Information)
-                msg.setStyleSheet("background-color: #2b2b2b; color: #fff;")
-                # msg.exec_() # Раскомментируйте, если хотите видеть это окно при каждом запуске
-                logger.file(f"APP STARTED. Log path: {logger.log_path}")
-            except:
-                pass
-
     def fix_focus_policies(self):
         # Используем ClickFocus, чтобы кнопки можно было нажимать мышью,
         # но они не захватывали фокус при нажатии Tab.
-        # Это более безопасно, чем NoFocus.
         for btn in self.findChildren(QPushButton):
             btn.setFocusPolicy(Qt.ClickFocus)
         self.scrubber.setFocusPolicy(Qt.NoFocus)
@@ -513,7 +500,9 @@ class ProSportsAnalyzer(QMainWindow):
         self.video_container.setCursor(Qt.ArrowCursor)
 
     def on_scrubber_change(self, val):
-        if hasattr(self, "thread") and self.thread.engine.cap:
+        if hasattr(self, "thread") and (
+            self.thread.engine.av_container or self.thread.engine.cap
+        ):
             if self.scrubber.isEnabled() and not self.scrubber.signalsBlocked():
                 self.seek_video(val)
         self.setFocus()
@@ -617,7 +606,7 @@ class ProSportsAnalyzer(QMainWindow):
                     if current_pos > 0:
                         self.seek_video(current_pos)
                 else:
-                    if eng.cap is None or not eng.cap.isOpened():
+                    if eng.cap is None and eng.av_container is None:
                         self.check_and_load_video(original_path)
                         self.seek_video(current_pos)
 
@@ -836,11 +825,9 @@ class ProSportsAnalyzer(QMainWindow):
             self.reset_session_data()
         else:
             self.playing = False
-            self.thread.stop()
-            self.thread.wait()
+            self.thread.set_playing(False)
 
         self.current_ext = os.path.splitext(path)[1]
-
         use_proxy_global = self.settings.get("use_proxy", True)
         ask_to_create = self.settings.get("ask_proxy_creation", True)
 
@@ -850,7 +837,6 @@ class ProSportsAnalyzer(QMainWindow):
             effective_try = try_proxy and use_proxy_global
 
         self.thread.load_video(path, try_proxy=effective_try)
-
         eng = self.thread.engine
 
         if not eng.is_proxy_active and not force_proxy and use_proxy_global:
@@ -874,7 +860,7 @@ class ProSportsAnalyzer(QMainWindow):
                     gen_path = eng.generate_proxy_path(path, qual)
 
                     self.start_proxy_generation(path, gen_path)
-                    self.thread.stop()
+                    self.thread.set_playing(False)
                     self.update_proxy_ui_status()
                     return
 
@@ -941,8 +927,7 @@ class ProSportsAnalyzer(QMainWindow):
     def reset_session_data(self):
         self.playing = False
         if hasattr(self, "thread"):
-            self.thread.stop()
-            self.thread.wait()
+            self.thread.set_playing(False)
 
         self.segments = []
         self.markers = []
@@ -985,7 +970,7 @@ class ProSportsAnalyzer(QMainWindow):
                     mark["frame"] = int(mark["frame"] * ratio)
 
     def set_video_info(self, info):
-        logger.debug(f"set_video_info called: {info}")
+        logger.debug(f"set_video_info: {info}")
         self.fps = info["fps"]
         self.total_frames = info["total"]
 
@@ -997,11 +982,10 @@ class ProSportsAnalyzer(QMainWindow):
             saved_history = self._temp_state_for_reload["history"]
             saved_redo = self._temp_state_for_reload["redo_stack"]
 
-            # Prevent drift: Only remap if FPS difference is significant
             if abs(self.fps - old_fps) > 0.1 and old_fps > 0:
                 ratio = self.fps / old_fps
                 logger.debug(
-                    f"FPS changed: {old_fps:.2f} -> {self.fps:.2f}. Remapping history."
+                    f"FPS changed: {old_fps:.2f} -> {self.fps:.2f}. Remapping."
                 )
 
                 for seg in saved_segments:
@@ -1085,7 +1069,6 @@ class ProSportsAnalyzer(QMainWindow):
                 self.btn_create_proxy_manual.setStyleSheet(
                     "background-color: #444; border: 1px solid #666; color: #fff;"
                 )
-
                 self.btn_create_proxy_manual.show()
 
     @Slot(object)
@@ -1099,7 +1082,6 @@ class ProSportsAnalyzer(QMainWindow):
             self.draw_frame(self.last_frame)
 
     def draw_frame(self, frame):
-        # logger.debug("draw_frame called")
         if frame is None:
             return
         h_orig, w_orig, ch = frame.shape
@@ -1156,32 +1138,31 @@ class ProSportsAnalyzer(QMainWindow):
         else:
             interp = cv2.INTER_LINEAR
 
+        # --- CONVEYER DOUBLE ZERO-MEMORY-ALLOCATION ---
+        # Инициализируем/реаллоцируем постоянные буферы только при изменении разрешения окна
+        if (
+            self.rgb_buffer is None
+            or self.rgb_buffer_shape[0] != target_h
+            or self.rgb_buffer_shape[1] != target_w
+        ):
+            self.rgb_buffer = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            self.rgb_buffer_shape = (target_h, target_w, 3)
+
         try:
-            frame_resized = cv2.resize(
-                cropped, (target_w, target_h), interpolation=interp
+            # Декодирование и изменение разрешения происходят НАПРЯМУЮ в наш статический буфер в ОЗУ
+            cv2.resize(
+                cropped, (target_w, target_h), dst=self.rgb_buffer, interpolation=interp
             )
         except cv2.error:
-            logger.debug("cv2.error in resize")
             return
 
-        # logger.debug("converting color")
-        rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-
-        # Safer QImage creation without immediate .copy() on potentially unstable memory
-        # We also explicitly calculate bytesPerLine to avoid Stride mismatch crashes
-        height, width, channel = rgb.shape
-        bytesPerLine = 3 * width
-
-        # logger.debug(f"Creating QImage: {width}x{height}, line={bytesPerLine}")
-
-        # NOTE: We keep a reference to 'rgb' only as long as qimg is needed for conversion
-        # QPixmap.fromImage makes a deep copy into video memory immediately
-        qimg = QImage(rgb.data, width, height, bytesPerLine, QImage.Format_RGB888)
-
-        # logger.debug("Creating Pixmap")
+        # Фоновый поток шлет кадры уже в RGB формате, поэтому мы избегаем вызова cv2.cvtColor
+        # и напрямую по ссылке на память буфера создаем QImage без выделения RAM
+        qimg = QImage(
+            self.rgb_buffer.data, target_w, target_h, 3 * target_w, QImage.Format_RGB888
+        )
         pixmap = QPixmap.fromImage(qimg)
 
-        # logger.debug("Starting Painter")
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -1223,19 +1204,14 @@ class ProSportsAnalyzer(QMainWindow):
         from video_engine import IS_DEBUG
 
         if IS_DEBUG:
-            # logger.debug("Drawing debug overlay")
             self.draw_debug_overlay(painter, pixmap.width(), pixmap.height())
 
         painter.end()
-        # logger.debug("Setting Pixmap")
         self.video_label.setPixmap(pixmap)
         self.timeline.set_current_frame(self.current_frame)
         self.calculate_stats()
-        # logger.debug("draw_frame finished")
 
     def draw_debug_overlay(self, painter, w, h):
-        # Replaced Mutex Lock with Try/Except
-        # Locking mutex from UI thread while Video thread is running causes deadlocks/crashes
         try:
             bar_h = 20
             y = h - bar_h - 10
@@ -1250,8 +1226,10 @@ class ProSportsAnalyzer(QMainWindow):
             center_x = margin + bar_w / 2
 
             eng = self.thread.engine
-
             rect_w = bar_w / (range_val * 2)
+
+            # Получаем потокобезопасную копию множества ключей кэша (0 фризов, 0 вылетов по RuntimeError)
+            cached_keys = eng.get_cached_set()
 
             for offset in range(-range_val, range_val):
                 abs_frame = self.current_frame + offset
@@ -1260,7 +1238,7 @@ class ProSportsAnalyzer(QMainWindow):
 
                 x = center_x + offset * rect_w
 
-                if abs_frame in eng.cache_index_map:
+                if abs_frame in cached_keys:
                     painter.setBrush(QColor(0, 255, 0, 200))
                 else:
                     painter.setBrush(QColor(255, 0, 0, 100))
@@ -1277,9 +1255,6 @@ class ProSportsAnalyzer(QMainWindow):
             painter.drawText(
                 margin, y - 10, f"Cache: {len(eng.cache)}/{eng.CACHE_SIZE}"
             )
-        except RuntimeError:
-            # Dictionary changed size during iteration, just skip this frame's debug
-            pass
         except Exception as e:
             logger.debug(f"Overlay error: {e}")
 
@@ -1449,7 +1424,6 @@ class ProSportsAnalyzer(QMainWindow):
             if self.timeline.selected_marker_idx < len(self.markers):
                 m = self.markers[self.timeline.selected_marker_idx]
                 self.lbl_info_seg.setText(f"МЕТКА: {m['tag']}")
-                # [FIX] Protect division by zero
                 if self.fps > 0:
                     self.lbl_rel_time.setText(f"Время: {m['frame'] / self.fps:.3f}s")
                 else:
@@ -1482,8 +1456,6 @@ class ProSportsAnalyzer(QMainWindow):
                 if s <= m["frame"] <= e and m.get("visible", True)
             ]
             n = len(vis_marks)
-
-            # Safe division for tempo
             tempo = (n / dur * 60) if (dur > 0 and self.fps > 0) else 0
 
             self.lbl_info_seg.setText(f"Отрезок #{idx + 1}")
@@ -1507,16 +1479,17 @@ class ProSportsAnalyzer(QMainWindow):
     def on_video_finished(self):
         self.playing = False
         self.redraw_current_frame()
-        self.thread.stop()
+        self.thread.set_playing(False)
 
     def toggle_play(self):
-        if not self.thread.engine.cap or self.is_merge_mode:
+        if (
+            self.thread.engine.cap is None and self.thread.engine.av_container is None
+        ) or self.is_merge_mode:
             return
         self.playing = not self.playing
-        if self.playing:
-            self.thread.start()
-        else:
-            self.thread.stop()
+        # Используем современное переключение состояния фонового плеера вместо перезапуска QThread
+        self.thread.set_playing(self.playing)
+        if not self.playing:
             self.redraw_current_frame()
 
     def change_speed(self, val):
@@ -1527,7 +1500,7 @@ class ProSportsAnalyzer(QMainWindow):
     def seek_video(self, frame):
         self.current_frame = frame
         self.playing = False
-        self.thread.stop()
+        self.thread.set_playing(False)
         self.thread.seek(frame)
         self.calculate_stats()
 
@@ -1613,7 +1586,7 @@ class ProSportsAnalyzer(QMainWindow):
     def start_merge_mode(self):
         self.is_merge_mode = True
         self.playing = False
-        self.thread.stop()
+        self.thread.set_playing(False)
         self.redraw_current_frame()
         self.overlay_widget.show()
         self.btn_merge.hide()
@@ -1659,7 +1632,6 @@ class ProSportsAnalyzer(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
     app_icon = QIcon(get_resource_path("favicon.ico"))
     app.setWindowIcon(app_icon)
 
