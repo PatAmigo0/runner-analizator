@@ -1,16 +1,12 @@
-import cv2
-import numpy as np
+# type: ignore
 from PySide2.QtCore import QPointF
 
 
 class ViewportHandler:
-    def __init__(self, video_label):
-        self.video_label = video_label
+    def __init__(self, video_widget):
+        self.video_widget = video_widget
         self.zoom = 1.0
         self.pan = QPointF(0, 0)
-        self.bgr_buffer = None
-        self.rgb_buffer = None
-        self.rgb_buffer_shape = (0, 0, 3)
 
     def reset(self):
         self.zoom = 1.0
@@ -35,8 +31,8 @@ class ViewportHandler:
         self.pan += QPointF(delta_x, delta_y)
 
     def get_mapping_params(self, h_orig, w_orig):
-        lbl_w = self.video_label.width()
-        lbl_h = self.video_label.height()
+        lbl_w = self.video_widget.width()
+        lbl_h = self.video_widget.height()
         if lbl_w <= 1 or lbl_h <= 1:
             return None
 
@@ -105,40 +101,3 @@ class ViewportHandler:
             y_crop = (y_pix / params["target_h"]) * params["src_h"]
             return (params["x1"] + x_crop, params["y1"] + y_crop)
         return None
-
-    def crop_and_resize(self, frame, params):
-        x1, y1 = params["x1"], params["y1"]
-        src_w, src_h = params["src_w"], params["src_h"]
-        target_w, target_h = params["target_w"], params["target_h"]
-
-        if self.zoom > 1.0 and src_w >= 2 and src_h >= 2:
-            cropped = frame[y1 : y1 + src_h, x1 : x1 + src_w]
-        else:
-            cropped = frame
-
-        if self.zoom > 3.0:
-            interp = cv2.INTER_NEAREST
-        elif self.zoom < 1.0:
-            interp = cv2.INTER_AREA
-        else:
-            interp = cv2.INTER_LINEAR
-
-        if (
-            self.rgb_buffer is None
-            or self.rgb_buffer_shape[0] != target_h
-            or self.rgb_buffer_shape[1] != target_w
-        ):
-            self.bgr_buffer = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-            self.rgb_buffer = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-            self.rgb_buffer_shape = (target_h, target_w, 3)
-
-        try:
-            self.bgr_buffer = cv2.resize(
-                cropped, (target_w, target_h), dst=self.bgr_buffer, interpolation=interp
-            )
-            self.rgb_buffer = cv2.cvtColor(
-                self.bgr_buffer, cv2.COLOR_BGR2RGB, dst=self.rgb_buffer
-            )
-            return self.rgb_buffer, target_w, target_h
-        except cv2.error:
-            return None, 0, 0

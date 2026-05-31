@@ -5,16 +5,12 @@ import sys
 import time
 import traceback
 
-from PySide2.QtCore import QPointF, QRect, Qt, Slot
+from PySide2.QtCore import QPointF, Qt, Slot
 from PySide2.QtGui import (
-    QBrush,
     QColor,
     QFont,
     QIcon,
-    QImage,
     QKeyEvent,
-    QPainter,
-    QPixmap,
 )
 from PySide2.QtWidgets import (
     QApplication,
@@ -22,7 +18,7 @@ from PySide2.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
-    QListWidgetItem,  # Вернули для update_filter_list
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -42,8 +38,6 @@ from dialogs import (
 from drawing_manager import DrawingManager
 from formulas import FormulasWindow
 from settings import SettingsManager
-
-# Импортируем менеджеры состояния (из предыдущего шага) и новые UI-компоненты
 from state_manager import StateManager
 from timeline import TimelineWidget
 from ui_left_panel import LeftPanelWidget
@@ -71,10 +65,12 @@ if IS_DEBUG:
     os.environ["OPENCV_FFMPEG_DEBUG"] = "1"
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "video_codec;h264_cuvid"
 
+VERSION = 1.8
+
 try:
     import ctypes
 
-    appid = "arseni.kuskou.prosportsanalyzer.1.7.stable"
+    appid = f"arseni.kuskou.prosportsanalyzer.{VERSION}.stable"
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
 except ImportError:
     pass
@@ -107,7 +103,7 @@ class ProSportsAnalyzer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.settings = SettingsManager()
-        self.setWindowTitle(f"Pro Sports Analyzer v1.7.{int(not IS_DEBUG)}")
+        self.setWindowTitle(f"Pro Sports Analyzer v{VERSION}.{int(not IS_DEBUG)}")
 
         self.resize(1400, 820)
         self.setAcceptDrops(True)
@@ -182,8 +178,8 @@ class ProSportsAnalyzer(QMainWindow):
 
         self.init_ui()
 
-        # Инициализация Viewport (после init_ui, т.к. video_label уже создан)
-        self.viewport = ViewportHandler(self.video_label)
+        # Инициализация Viewport (передаем новый аппаратный холст)
+        self.viewport = ViewportHandler(self.video_canvas)
 
     def init_ui(self):
         icon_path = get_resource_path("favicon.ico")
@@ -237,7 +233,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.video_container = VideoContainerWidget()
         top_layout.addWidget(self.video_container, stretch=1)
 
-        self.video_label = self.video_container.video_label
+        self.video_canvas = self.video_container.video_canvas
         self.overlay_widget = self.video_container.overlay_widget
 
         self.video_container.wheel_scrolled.connect(self.video_wheel_event)
@@ -575,6 +571,7 @@ class ProSportsAnalyzer(QMainWindow):
         idx = self.timeline.selected_marker_idx
         if idx != -1 and idx < len(self.state.markers):
             self.state.markers[idx]["color"] = c
+            self.timeline._bg_dirty = True
             self.timeline.update()
             self.redraw_current_frame()
         else:
@@ -586,6 +583,7 @@ class ProSportsAnalyzer(QMainWindow):
         idx = self.timeline.selected_marker_idx
         if idx != -1 and idx < len(self.state.markers):
             self.state.markers[idx]["tag"] = t
+            self.timeline._bg_dirty = True
             self.timeline.update()
             self.redraw_current_frame()
         else:
@@ -635,6 +633,7 @@ class ProSportsAnalyzer(QMainWindow):
         for m in self.state.markers:
             if m["tag"] == t:
                 m["visible"] = v
+        self.timeline._bg_dirty = True
         self.timeline.update()
         self.calculate_stats()
         self.redraw_current_frame()
@@ -671,7 +670,8 @@ class ProSportsAnalyzer(QMainWindow):
         self.thread.full_release()
         self.playing = False
         self.scrubber.setEnabled(False)
-        self.video_label.clear()
+        self.video_canvas.frame = None
+        self.video_canvas.update()
 
         name, _ = os.path.splitext(os.path.basename(path))
         self.settings.cleanup_old_proxies(name)
@@ -789,7 +789,10 @@ class ProSportsAnalyzer(QMainWindow):
         self.scrubber.setEnabled(False)
         self.scrubber.setValue(0)
         self.timeline.set_data(0, 30, [], [])
-        self.video_label.clear()
+
+        self.video_canvas.frame = None
+        self.video_canvas.update()
+
         self.overlay_widget.hide()
         self.btn_merge.show()
         self.btn_cancel_merge.hide()
@@ -883,99 +886,76 @@ class ProSportsAnalyzer(QMainWindow):
         if self.last_frame is not None:
             self.draw_frame(self.last_frame)
 
+    # ИСПОЛЬЗУЕМ QOpenGLWidget ДЛЯ АППАРАТНОГО РЕНДЕРИНГА
     def draw_frame(self, frame):
         if frame is None:
             return
 
-        params = self.viewport.get_mapping_params(frame.shape[0], frame.shape[1])
-        if not params:
-            return
-
-        rgb_buf, target_w, target_h = self.viewport.crop_and_resize(frame, params)
-        if rgb_buf is None:
-            return
-
-        qimg = QImage(
-            rgb_buf.data, target_w, target_h, 3 * target_w, QImage.Format_RGB888
+        self.video_canvas.update_data(
+            frame=frame,
+            idx=self.current_frame,
+            markers=self.state.markers,
+            dm=self.drawing_manager,
+            viewport=self.viewport,
+            playing=self.playing,
+            merge_mode=self.is_merge_mode,
+            main_win=self,
         )
-        pixmap = QPixmap.fromImage(qimg)
-
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        for m in self.state.markers:
-            if m.get("visible", True) and m["frame"] == self.current_frame:
-                tag_text = f"🚩 {m.get('tag', 'Mark')}"
-                font = QFont("Segoe UI", 16, QFont.Bold)
-                painter.setFont(font)
-                metrics = painter.fontMetrics()
-                text_w = metrics.horizontalAdvance(tag_text)
-                text_h = metrics.height()
-                pad = 10
-                box_x = pixmap.width() - (text_w + pad * 2) - 20
-                box_y = 20
-                painter.setBrush(QBrush(QColor(m["color"])))
-                painter.setPen(Qt.white)
-                painter.drawRoundedRect(
-                    box_x, box_y, text_w + pad * 2, text_h + pad, 5, 5
-                )
-                painter.drawText(
-                    QRect(box_x, box_y, text_w + pad * 2, text_h + pad),
-                    Qt.AlignCenter,
-                    tag_text,
-                )
-                break
-
-        if not self.playing and not self.is_merge_mode:
-            self.draw_overlay_text(painter, "⏸ ПАУЗА", 20, 20)
-
-        if self.viewport.zoom > 1.01:
-            self.draw_overlay_text(
-                painter,
-                f"ZOOM: {self.viewport.zoom:.1f}x",
-                20,
-                pixmap.height() - 50,
-                bg_alpha=100,
-            )
-
-        def map_orig_to_pix(x_o, y_o):
-            x_c = x_o - params["x1"]
-            y_c = y_o - params["y1"]
-            x_p = (x_c / params["src_w"]) * target_w
-            y_p = (y_c / params["src_h"]) * target_h
-            return (x_p, y_p)
-
-        current_mouse_screen = self.video_container.mapFromGlobal(self.cursor().pos())
-        current_mouse_orig = self.viewport.screen_to_original(
-            current_mouse_screen, frame.shape
-        )
-
-        self.drawing_manager.draw_on_painter(
-            painter, self.current_frame, map_orig_to_pix, current_mouse_orig
-        )
-
-        if IS_DEBUG:
-            self.draw_debug_overlay(painter, pixmap.width(), pixmap.height())
-
-        painter.end()
-        self.video_label.setPixmap(pixmap)
         self.timeline.set_current_frame(self.current_frame)
         self.calculate_stats()
 
-    def draw_debug_overlay(self, painter, w, h):
+    def draw_debug_overlay_painter(self, painter, w, h):
         try:
-            bar_h = 20
-            y = h - bar_h - 10
+            eng = self.thread.engine
+
+            painter.setBrush(QColor(0, 0, 0, 180))
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(10, 10, 370, 130, 5, 5)
+
+            painter.setPen(QColor("#00ff00"))
+            painter.setFont(QFont("Consolas", 11, QFont.Bold))
+
+            backend_name = "Нет"
+            decode_mode = "CPU"
+
+            if hasattr(eng, "cap") and eng.cap and eng.cap.isOpened():
+                backend_name = eng.cap.getBackendName()
+                if eng.use_gpu:
+                    decode_mode = "GPU (OpenCV HW)"
+            elif hasattr(eng, "is_av_active") and eng.is_av_active:
+                backend_name = "PyAV (FFmpeg)"
+                decode_mode = (
+                    "CPU (Многопоточно)"  # PyAV в данном скрипте использует CPU потоки
+                )
+
+            render_type = (
+                "GPU OpenGL" if "Canvas" in type(self.video_canvas).__name__ else "CPU"
+            )
+            proxy_state = "ВКЛЮЧЕН (Быстро)" if eng.is_proxy_active else "ОТКЛЮЧЕН"
+
+            stats = [
+                f"Рендер   : {render_type}",
+                f"Чтение   : {backend_name} | {decode_mode}",
+                f"Proxy    : {proxy_state}",
+                f"Кэш RAM  : {len(eng.cache)} / {eng.CACHE_SIZE} кадров",
+                f"Источник : {eng.width}x{eng.height} @ {eng.fps:.1f} FPS",
+            ]
+
+            for i, text in enumerate(stats):
+                painter.drawText(25, 35 + i * 22, text)
+
+            # Визуализация кэша
+            bar_h = 15
+            y = h - bar_h - 15
             margin = 50
             bar_w = w - 2 * margin
 
-            painter.setBrush(QColor(0, 0, 0, 150))
+            painter.setBrush(QColor(0, 0, 0, 180))
             painter.setPen(Qt.NoPen)
             painter.drawRect(margin, y, bar_w, bar_h)
 
             range_val = 60
             center_x = margin + bar_w / 2
-            eng = self.thread.engine
             rect_w = bar_w / (range_val * 2)
             cached_keys = eng.get_cached_set()
 
@@ -992,25 +972,9 @@ class ProSportsAnalyzer(QMainWindow):
 
             painter.setPen(QColor(255, 255, 255))
             painter.drawLine(int(center_x), y - 5, int(center_x), y + bar_h + 5)
-            painter.setPen(Qt.white)
-            painter.setFont(QFont("Arial", 10))
-            painter.drawText(
-                margin, y - 10, f"Cache: {len(eng.cache)}/{eng.CACHE_SIZE}"
-            )
-        except Exception as e:
-            logger.debug(f"Overlay error: {e}")
 
-    def draw_overlay_text(self, painter, text, x, y, bg_alpha=150):
-        font = QFont("Segoe UI", 16, QFont.Bold)
-        painter.setFont(font)
-        metrics = painter.fontMetrics()
-        w = metrics.horizontalAdvance(text) + 20
-        h = metrics.height() + 10
-        painter.setBrush(QBrush(QColor(0, 0, 0, bg_alpha)))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(x, y, w, h, 5, 5)
-        painter.setPen(Qt.white)
-        painter.drawText(QRect(x, y, w, h), Qt.AlignCenter, text)
+        except Exception:
+            pass
 
     @undoable
     def add_mark(self):
@@ -1027,6 +991,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.state.markers.append(new_marker)
         self.state.markers.sort(key=lambda x: x["frame"])
         self.update_filter_list()
+        self.timeline._bg_dirty = True
         self.timeline.update()
         self.calculate_stats()
         self.redraw_current_frame()
@@ -1068,6 +1033,7 @@ class ProSportsAnalyzer(QMainWindow):
                     self.timeline.selected_segment_idx = (
                         idx if dlg.choice == "left" else idx + 1
                     )
+                    self.timeline._bg_dirty = True
                     self.timeline.update()
                     self.calculate_stats()
             self.setFocus()
@@ -1087,6 +1053,7 @@ class ProSportsAnalyzer(QMainWindow):
                 else:
                     self.state.segments[0]["start"] = deleted["start"]
                 self.timeline.selected_segment_idx = -1
+        self.timeline._bg_dirty = True
         self.timeline.update()
         self.calculate_stats()
         self.update_ui_marker_controls()
@@ -1105,6 +1072,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.state.segments.insert(min(i1, i2), new_seg)
         self.timeline.selected_segment_idx = min(i1, i2)
         self.stop_merge_mode()
+        self.timeline._bg_dirty = True
         self.timeline.update()
         self.calculate_stats()
 
@@ -1112,6 +1080,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.timeline.selected_segment_idx = -1
         self.timeline.selected_marker_idx = -1
         self.update_ui_marker_controls()
+        self.timeline._bg_dirty = True
         self.timeline.update()
         self.calculate_stats()
 
@@ -1134,6 +1103,7 @@ class ProSportsAnalyzer(QMainWindow):
                 self.merge_buffer.pop(0)
 
         self.timeline.merge_candidates = self.merge_buffer
+        self.timeline._bg_dirty = True
         self.timeline.update()
 
         if len(self.merge_buffer) == 2:
@@ -1150,6 +1120,7 @@ class ProSportsAnalyzer(QMainWindow):
                 msg.exec_()
                 self.merge_buffer = []
                 self.timeline.merge_candidates = []
+                self.timeline._bg_dirty = True
                 self.timeline.update()
 
     def calculate_stats(self):
@@ -1261,6 +1232,7 @@ class ProSportsAnalyzer(QMainWindow):
         new_idx = min(len(self.state.segments) - 1, curr + 1)
         self.timeline.selected_segment_idx = new_idx
         self.timeline.selected_marker_idx = -1
+        self.timeline._bg_dirty = True
         self.timeline.update()
         self.seek_video(self.state.segments[new_idx]["start"])
         self.calculate_stats()
@@ -1272,6 +1244,7 @@ class ProSportsAnalyzer(QMainWindow):
         new_idx = max(0, curr - 1)
         self.timeline.selected_segment_idx = new_idx
         self.timeline.selected_marker_idx = -1
+        self.timeline._bg_dirty = True
         self.timeline.update()
         self.seek_video(self.state.segments[new_idx]["start"])
         self.calculate_stats()
@@ -1327,6 +1300,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.merge_buffer = []
         self.timeline.set_merge_mode(True)
         self.timeline.selected_segment_idx = -1
+        self.timeline._bg_dirty = True
         self.timeline.update()
 
     def stop_merge_mode(self):
@@ -1338,6 +1312,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.btn_split.setEnabled(True)
         self.btn_delete.setEnabled(True)
         self.timeline.set_merge_mode(False)
+        self.timeline._bg_dirty = True
         self.timeline.update()
 
     @stop_playback
