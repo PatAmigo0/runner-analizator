@@ -1,20 +1,18 @@
 # type: ignore
 
-import gc  # [FIX] Added for garbage collection
+import gc
 import glob
 import os
 import time
 from collections import deque
 
 import cv2
+from logger import Logger
 from PySide2.QtCore import QThread, Signal
 
 IS_DEBUG = "__compiled__" not in globals()
 
-
-def debug_log(msg):
-    if IS_DEBUG:
-        print(f"[ENGINE] {msg}")
+logger = Logger(IS_DEBUG)
 
 
 # --- PROXY GENERATOR ---
@@ -33,6 +31,7 @@ class ProxyGeneratorThread(QThread):
     def run(self):
         cap = cv2.VideoCapture(self.input_path, cv2.CAP_ANY)
         if not cap.isOpened():
+            logger.file(f"Critical: Failed to open source for proxy: {self.input_path}")
             self.finished_signal.emit(False, "")
             return
 
@@ -80,7 +79,7 @@ class ProxyGeneratorThread(QThread):
 
         # Fallback, если кодек не открылся
         if not out.isOpened():
-            debug_log(f"Codec {self.codec} failed. Fallback to mp4v.")
+            logger.file(f"Codec {self.codec} failed. Fallback to mp4v.")
             root, _ = os.path.splitext(self.output_path)
             self.output_path = root + ".mp4"
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -88,6 +87,7 @@ class ProxyGeneratorThread(QThread):
                 self.output_path, fourcc, write_fps, (new_width, new_height)
             )
             if not out.isOpened():
+                logger.file("Critical: Fallback codec also failed.")
                 cap.release()
                 self.finished_signal.emit(False, "")
                 return
@@ -107,7 +107,7 @@ class ProxyGeneratorThread(QThread):
                 else:
                     out.write(frame)
             except Exception as e:
-                debug_log(f"Proxy gen error at frame {count}: {e}")
+                logger.file(f"Proxy gen error at frame {count}: {e}")
 
             count += 1
             if total > 0 and count % 10 == 0:
@@ -117,7 +117,7 @@ class ProxyGeneratorThread(QThread):
                     dt = time.time() - start_time
                     if dt > 0:
                         perf_fps = count / dt
-                        debug_log(
+                        logger.debug(
                             f"Encoding {self.codec}: {percent}% @ {perf_fps:.1f} FPS"
                         )
 
@@ -180,7 +180,7 @@ class VideoEngine:
             new_effort = self.settings.get("seek_effort", 20)
             if self.smart_seek_lookback != new_effort:
                 self.smart_seek_lookback = new_effort
-                debug_log(
+                logger.debug(
                     f"Live settings update: Lookback set to {self.smart_seek_lookback}"
                 )
 
@@ -216,10 +216,10 @@ class VideoEngine:
                 if self.load_internal(found_proxy):
                     self.is_proxy_active = True
                     self.proxy_path = found_proxy
-                    debug_log(f"Loaded PROXY: {found_proxy}")
+                    logger.debug(f"Loaded PROXY: {found_proxy}")
                     return True
 
-        debug_log(f"Loaded ORIGINAL: {path}")
+        logger.debug(f"Loaded ORIGINAL: {path}")
         return self.load_internal(path)
 
     def load_internal(self, path):
@@ -234,12 +234,12 @@ class VideoEngine:
             if hasattr(cv2, const_name):
                 selected_api = getattr(cv2, const_name)
             else:
-                debug_log(
+                logger.file(
                     f"WARNING: Backend {backend_name} not found in cv2. Fallback to AUTO."
                 )
                 selected_api = cv2.CAP_ANY
 
-        debug_log(
+        logger.debug(
             f"Attempting to open video with API: {backend_name} (Val: {selected_api})"
         )
 
@@ -247,7 +247,7 @@ class VideoEngine:
 
         if not self.cap.isOpened():
             if selected_api != cv2.CAP_ANY:
-                debug_log(
+                logger.debug(
                     f"Backend {backend_name} failed to open file. Trying AUTO fallback..."
                 )
                 self.cap = cv2.VideoCapture(path, cv2.CAP_ANY)
@@ -255,7 +255,7 @@ class VideoEngine:
         if self.cap.isOpened():
             # --- REAL DEBUGGING ---
             real_backend = self.cap.getBackendName()
-            debug_log(
+            logger.debug(
                 f"SUCCESS: Video opened. Requested: {backend_name} -> Actual: {real_backend}"
             )
 
@@ -302,7 +302,7 @@ class VideoEngine:
                 self.is_fast_seek = False
                 self.smart_seek_lookback = user_lookback
 
-            debug_log(
+            logger.debug(
                 f"Info: {self.width}x{self.height} @ {self.fps:.2f}fps, Codec: {fourcc_str}"
             )
 
@@ -311,7 +311,7 @@ class VideoEngine:
             self.cache_index_map.clear()
             return True
 
-        debug_log("CRITICAL: Failed to open video with any backend.")
+        logger.file("CRITICAL: Failed to open video with any backend.")
         return False
 
     def generate_proxy_path(self, original_path, quality):
@@ -425,7 +425,7 @@ class VideoEngine:
                 self.current_frame_index = target_frame
                 dt = time.time() - t0
                 if dt > 0.1:
-                    debug_log(f"Seek lag: {dt:.3f}s (Target: {target_frame})")
+                    logger.debug(f"Seek lag: {dt:.3f}s (Target: {target_frame})")
                 return True, found_frame, target_frame
 
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
