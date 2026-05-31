@@ -11,7 +11,9 @@ class TimelineWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setFixedHeight(140)
+        # ОПТИМИЗАЦИЯ ИНТЕРФЕЙСА: Снижаем высоту со 140 до 115, чтобы сэкономить
+        # вертикальное пространство и предотвратить обрезание элементов в Qt Layout.
+        self.setFixedHeight(115)
         self.setMouseTracking(True)
 
         self.total_frames = 100
@@ -31,8 +33,8 @@ class TimelineWidget(QWidget):
 
         self.margin_left = 15
         self.margin_right = 15
-        self.track_height = 50
-        self.track_y = 50
+        self.track_height = 38
+        self.track_y = 25
 
         self.view_start = 0.0
         self.view_length = 100.0
@@ -219,12 +221,13 @@ class TimelineWidget(QWidget):
                 painter.setBrush(QBrush(color))
                 painter.setPen(pen)
 
-                tri_w = 12
-                tri_h = 24
+                # Масштабируем маркеры под новую высоту виджета
+                tri_w = 10
+                tri_h = 20
 
                 polygon = QPolygonF(
                     [
-                        QPointF(mx, base_y - 5),
+                        QPointF(mx, base_y - 3),
                         QPointF(mx - tri_w, base_y + tri_h),
                         QPointF(mx + tri_w, base_y + tri_h),
                     ]
@@ -234,7 +237,7 @@ class TimelineWidget(QWidget):
                 tag = m.get("tag", "")
                 if tag:
                     letter = tag[0].upper()
-                    text_rect = QRectF(mx - tri_w, base_y + 2, tri_w * 2, tri_h)
+                    text_rect = QRectF(mx - tri_w, base_y + 1, tri_w * 2, tri_h)
                     painter.setPen(QColor("#ffffff"))
                     painter.drawText(text_rect, Qt.AlignCenter, letter)
 
