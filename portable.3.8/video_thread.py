@@ -15,35 +15,40 @@ class VideoThread(QThread):
         self.settings = settings
         self.engine = VideoEngine(settings)
         self._run_flag = True
-        self.playing = (
-            False  # Управляет ходом воспроизведения внутри единого бесконечного потока
-        )
+
+        self.playing = False
         self.fps = 30
         self.speed = 1.0
         self.current_frame_num = 0
-        self.mutex = QMutex()
+
+        # ОПТИМИЗАЦИЯ ПОТОКОВ:
+        # engine_mutex - блокирует только тяжелые операции OpenCV/PyAV
+        # state_mutex - блокирует мгновенные переменные интерфейса, чтобы UI никогда не зависал
+        self.engine_mutex = QMutex()
+        self.state_mutex = QMutex()
+
         self.wait_condition = QWaitCondition()
         self.pending_seek = None
+        self.last_seek_time = time.time()
 
     def set_playing(self, play_state):
-        self.mutex.lock()
+        self.state_mutex.lock()
         try:
             self.playing = play_state
-            self.wait_condition.wakeAll()  # Пробуждаем поток немедленно!
+            self.wait_condition.wakeAll()
         finally:
-            self.mutex.unlock()
+            self.state_mutex.unlock()
 
     def update_settings_live(self):
-        self.mutex.lock()
+        self.engine_mutex.lock()
         try:
             self.engine.update_settings_live()
         finally:
-            self.mutex.unlock()
+            self.engine_mutex.unlock()
 
     def load_video(self, path, try_proxy=True):
-        # Не выключаем QThread полностью, а временно приостанавливаем проигрывание
         self.set_playing(False)
-        self.mutex.lock()
+        self.engine_mutex.lock()
         try:
             if self.engine.load(path, try_proxy):
                 info = self.engine.get_info()
@@ -51,30 +56,32 @@ class VideoThread(QThread):
                 self.current_frame_num = 0
                 self.video_info_signal.emit(info)
         finally:
-            self.mutex.unlock()
+            self.engine_mutex.unlock()
+
         self.read_one_frame()
 
-        # Если поток еще не был запущен в ОС, запускаем его
         if not self.isRunning():
             self.start()
 
     def read_one_frame(self):
-        self.mutex.lock()
+        self.engine_mutex.lock()
         try:
             ret, fr, idx = self.engine.read()
             if ret:
                 self.current_frame_num = idx
                 self.change_pixmap_signal.emit(fr)
         finally:
-            self.mutex.unlock()
+            self.engine_mutex.unlock()
 
     def seek(self, n):
-        self.mutex.lock()
+        # МГНОВЕННАЯ ОПЕРАЦИЯ: GUI поток никогда не зависнет здесь
+        self.state_mutex.lock()
         try:
             self.pending_seek = n
-            self.wait_condition.wakeAll()  # Пробуждаем поток немедленно!
+            self.last_seek_time = time.time()
+            self.wait_condition.wakeAll()
         finally:
-            self.mutex.unlock()
+            self.state_mutex.unlock()
 
     def run(self):
         self._run_flag = True
@@ -82,41 +89,38 @@ class VideoThread(QThread):
         frames_played_in_loop = 0
 
         while self._run_flag:
-            # 1. Проверяем, есть ли асинхронный запрос на перемещение (seek)
             target_seek = None
-            self.mutex.lock()
+            is_active_play = False
+
+            # Быстрое чтение команд от UI
+            self.state_mutex.lock()
             try:
                 if self.pending_seek is not None:
                     target_seek = self.pending_seek
                     self.pending_seek = None
-            finally:
-                self.mutex.unlock()
-
-            if target_seek is not None:
-                self.mutex.lock()
-                try:
-                    ret, fr, idx = self.engine.seek(target_seek)
-                    if ret:
-                        self.current_frame_num = idx
-                        self.change_pixmap_signal.emit(fr)
-                finally:
-                    self.mutex.unlock()
-
-                # Сбрасываем тайминги воспроизведения после перехода
-                start_playback_time = time.time()
-                frames_played_in_loop = 0
-                continue  # Сразу переходим к следующей итерации
-
-            is_active_play = False
-            self.mutex.lock()
-            try:
                 is_active_play = self.playing
             finally:
-                self.mutex.unlock()
+                self.state_mutex.unlock()
 
+            # --- ОБРАБОТКА ПОЛЗУНКА И СТРЕЛОЧЕК ---
+            if target_seek is not None:
+                self.engine_mutex.lock()
+                try:
+                    ret, fr, idx = self.engine.seek(target_seek)
+                finally:
+                    self.engine_mutex.unlock()
+
+                if ret:
+                    self.current_frame_num = idx
+                    self.change_pixmap_signal.emit(fr)
+
+                start_playback_time = time.time()
+                frames_played_in_loop = 0
+                continue  # Возвращаемся в начало, чтобы пропустить устаревшие кадры
+
+            # --- РЕЖИМ ВОСПРОИЗВЕДЕНИЯ ---
             if is_active_play:
-                # --- РЕЖИМ ВОСПРОИЗВЕДЕНИЯ ---
-                self.mutex.lock()
+                self.engine_mutex.lock()
                 fr_r = False
                 fr = None
                 try:
@@ -126,9 +130,9 @@ class VideoThread(QThread):
                         fr_r = True
                     else:
                         self.finished_signal.emit()
-                        self.playing = False
+                        self.set_playing(False)
                 finally:
-                    self.mutex.unlock()
+                    self.engine_mutex.unlock()
 
                 if fr_r and fr is not None:
                     self.change_pixmap_signal.emit(fr)
@@ -140,56 +144,58 @@ class VideoThread(QThread):
                     sleep_needed = expected_time - actual_time
 
                     if sleep_needed > 0:
-                        self.mutex.lock()
+                        self.state_mutex.lock()
                         try:
                             self.wait_condition.wait(
-                                self.mutex, int(sleep_needed * 1000)
+                                self.state_mutex, int(sleep_needed * 1000)
                             )
                         finally:
-                            self.mutex.unlock()
+                            self.state_mutex.unlock()
                     elif sleep_needed < -0.2:
                         start_playback_time = time.time()
                         frames_played_in_loop = 0
+
+            # --- РЕЖИМ ПАУЗЫ (ФОНОВОЕ КЭШИРОВАНИЕ) ---
             else:
-                # --- РЕЖИМ ПАУЗЫ: Алгоритм двунаправленного фонового префетча ---
                 prefetch_target = None
-                self.mutex.lock()
-                try:
-                    # Сканируем будущее (до 45 кадров вперед) на наличие незакэшированных кадров
-                    for offset in range(1, 46):
-                        cand = self.current_frame_num + offset
-                        if cand >= self.engine.total_frames:
-                            break
-                        if cand not in self.engine.cache_index_map:
-                            prefetch_target = cand
-                            break
-                finally:
-                    self.mutex.unlock()
+
+                # Ждем 100мс после последнего движения ползунка, чтобы префетч
+                # не воровал мощности процессора во время активного скраббинга
+                if time.time() - self.last_seek_time > 0.1:
+                    self.engine_mutex.lock()
+                    try:
+                        for offset in range(1, 46):
+                            cand = self.current_frame_num + offset
+                            if cand >= self.engine.total_frames:
+                                break
+                            if cand not in self.engine.cache_index_map:
+                                prefetch_target = cand
+                                break
+                    finally:
+                        self.engine_mutex.unlock()
 
                 if prefetch_target is not None:
-                    self.mutex.lock()
+                    self.engine_mutex.lock()
                     try:
                         old_idx = self.current_frame_num
                         self.engine.seek(prefetch_target)
                         self.engine.current_frame_index = old_idx
                     finally:
-                        self.mutex.unlock()
+                        self.engine_mutex.unlock()
 
-                    # Даем маленькую паузу, но если придет seek - просыпаемся мгновенно!
-                    self.mutex.lock()
+                    self.state_mutex.lock()
                     try:
-                        self.wait_condition.wait(self.mutex, 8)
+                        self.wait_condition.wait(self.state_mutex, 2)
                     finally:
-                        self.mutex.unlock()
+                        self.state_mutex.unlock()
                 else:
-                    # Если все будущие кадры уже закэшированы, засыпаем глубже
-                    self.mutex.lock()
+                    # Спим глубоко, если все закэшировано
+                    self.state_mutex.lock()
                     try:
-                        self.wait_condition.wait(self.mutex, 45)
+                        self.wait_condition.wait(self.state_mutex, 45)
                     finally:
-                        self.mutex.unlock()
+                        self.state_mutex.unlock()
 
-                # Сбрасываем тайминг синхронизации плеера
                 start_playback_time = time.time()
                 frames_played_in_loop = 0
 
@@ -202,8 +208,8 @@ class VideoThread(QThread):
 
     def full_release(self):
         self.stop()
-        self.mutex.lock()
+        self.engine_mutex.lock()
         try:
             self.engine.release()
         finally:
-            self.mutex.unlock()
+            self.engine_mutex.unlock()

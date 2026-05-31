@@ -126,7 +126,11 @@ class ProSportsAnalyzer(QMainWindow):
         super().__init__()
         self.settings = SettingsManager()
         self.setWindowTitle(f"Pro Sports Analyzer v1.7.{int(not IS_DEBUG)}")
-        self.resize(1600, 950)
+
+        # ОПТИМИЗАЦИЯ ДЛЯ ПРЕДОТВРАЩЕНИЯ СЖАТИЯ ИНТЕРФЕЙСА:
+        # Устанавливаем более компактное, стандартное разрешение окна (1400x820),
+        # чтобы интерфейс никогда не сжимался операционной системой на ноутбуках и ПК.
+        self.resize(1400, 820)
         self.setAcceptDrops(True)
         apply_dark_title_bar(self)
 
@@ -134,7 +138,7 @@ class ProSportsAnalyzer(QMainWindow):
             QMainWindow { background-color: #1e1e1e; color: #f0f0f0; font-family: Segoe UI; }
             QWidget { font-size: 14px; }
             QMessageBox { background-color: #2b2b2b; color: #f0f0f0; }
-            QGroupBox { border: 1px solid #444; margin-top: 20px; font-weight: bold; background-color: #2b2b2b; border-radius: 3px; padding-top: 15px; color: #ccc;}
+            QGroupBox { border: 1px solid #444; margin-top: 10px; font-weight: bold; background-color: #2b2b2b; border-radius: 3px; padding-top: 15px; color: #ccc;}
             QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; left: 10px; color: #fff; }
             QPushButton { background-color: #3a3a3a; border: 1px solid #555; padding: 6px 12px; color: white; border-radius: 2px; }
             QPushButton:hover { background-color: #505050; border-color: #777; }
@@ -203,6 +207,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.proxy_dialog = None
 
         # Инициализация статических буферов для Zero-Memory-Allocation
+        self.bgr_buffer = None
         self.rgb_buffer = None
         self.rgb_buffer_shape = (0, 0, 3)
 
@@ -224,20 +229,22 @@ class ProSportsAnalyzer(QMainWindow):
         cw = QWidget()
         self.setCentralWidget(cw)
         ml = QVBoxLayout(cw)
-        ml.setContentsMargins(10, 10, 10, 10)
-        ml.setSpacing(10)
+        ml.setContentsMargins(10, 5, 10, 5)
+        ml.setSpacing(8)
 
         top_layout = QHBoxLayout()
 
-        # Left Panel
+        # Left Panel (Сделана более компактной)
         lp = QWidget()
-        lp.setFixedWidth(320)
+        lp.setFixedWidth(310)
         ll = QVBoxLayout(lp)
         ll.setContentsMargins(0, 0, 0, 0)
+        ll.setSpacing(5)
         ll.setAlignment(Qt.AlignTop)
 
         gb_f = QGroupBox("Файл и Управление")
         lf = QVBoxLayout()
+        lf.setSpacing(6)
         b_op = QPushButton("📂 Открыть видео")
         b_op.clicked.connect(self.open_file)
 
@@ -261,6 +268,7 @@ class ProSportsAnalyzer(QMainWindow):
         lf.addWidget(self.btn_create_proxy_manual)
 
         l_info = QVBoxLayout()
+        l_info.setSpacing(2)
         self.lbl_vid_res = QLabel("Разрешение: -")
         self.lbl_vid_fps = QLabel("FPS: -")
         self.lbl_proxy_status = QLabel("")
@@ -274,8 +282,9 @@ class ProSportsAnalyzer(QMainWindow):
         # Markers
         gb_m = QGroupBox("Метки")
         lm = QVBoxLayout()
+        lm.setSpacing(6)
         self.btn_mark = QPushButton("🚩 ПОСТАВИТЬ МЕТКУ")
-        self.btn_mark.setMinimumHeight(40)
+        self.btn_mark.setMinimumHeight(38)
         self.btn_mark.setStyleSheet(
             "background-color: #b30000; font-weight: bold; font-size: 14px; border: 1px solid #f00;"
         )
@@ -287,7 +296,7 @@ class ProSportsAnalyzer(QMainWindow):
 
         h_m1 = QHBoxLayout()
         self.btn_color = QPushButton("")
-        self.btn_color.setFixedSize(24, 24)
+        self.btn_color.setFixedSize(22, 22)
         self.btn_color.clicked.connect(self.pick_color)
         self.inp_tag = QLineEdit("Main")
         self.inp_tag.returnPressed.connect(self.setFocus)
@@ -299,10 +308,11 @@ class ProSportsAnalyzer(QMainWindow):
 
         lm.addWidget(QLabel("Список меток:"))
         self.list_filters = QListWidget()
-
+        self.list_filters.setFixedHeight(
+            100
+        )  # Ограничиваем высоту для экономии пространства
         self.list_filters.setSelectionMode(QAbstractItemView.NoSelection)
         self.list_filters.setFocusPolicy(Qt.NoFocus)
-
         self.list_filters.itemChanged.connect(self.on_filter_changed)
         lm.addWidget(self.list_filters)
         gb_m.setLayout(lm)
@@ -311,6 +321,7 @@ class ProSportsAnalyzer(QMainWindow):
         # Actions
         gb_a = QGroupBox("Действия")
         la = QVBoxLayout()
+        la.setSpacing(6)
         h_ur = QHBoxLayout()
         self.btn_undo = QPushButton("↶ Отмена")
         self.btn_undo.clicked.connect(self.undo_action)
@@ -353,7 +364,10 @@ class ProSportsAnalyzer(QMainWindow):
         self.video_container.mouseReleaseEvent = self.video_mouse_release
 
         sl = QStackedLayout(self.video_container)
+        # Убираем все скрытые отступы у стэка, чтобы картинка никогда не обрезалась
+        sl.setContentsMargins(0, 0, 0, 0)
         sl.setStackingMode(QStackedLayout.StackAll)
+
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
@@ -371,13 +385,16 @@ class ProSportsAnalyzer(QMainWindow):
 
         # Right Panel
         rp = QWidget()
-        rp.setFixedWidth(300)
+        rp.setFixedWidth(290)
         rl = QVBoxLayout(rp)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(5)
         rl.setAlignment(Qt.AlignTop)
 
         gb_calc = QGroupBox("Анализ")
         gb_calc.setStyleSheet("QGroupBox { border: 1px solid #0078d7; }")
         lc = QVBoxLayout()
+        lc.setSpacing(4)
         self.lbl_global_frame = QLabel("Кадр: 0")
         self.lbl_global_time = QLabel("Время: 0.00s")
         self.lbl_info_seg = QLabel("Нет выбора")
@@ -410,7 +427,7 @@ class ProSportsAnalyzer(QMainWindow):
         btn_form = QPushButton("📐 Конструктор формул")
         btn_form.clicked.connect(self.show_formulas)
         btn_form.setStyleSheet(
-            "background-color: #6a0dad; margin-top: 10px; padding: 10px;"
+            "background-color: #6a0dad; margin-top: 5px; padding: 10px;"
         )
         rl.addWidget(btn_form)
 
@@ -433,10 +450,7 @@ class ProSportsAnalyzer(QMainWindow):
         self.scrubber = QSlider(Qt.Horizontal)
         self.scrubber.setRange(0, 100)
         self.scrubber.setEnabled(False)
-
-        # Оптимизация: Используем sliderMoved вместо valueChanged, чтобы избежать тормозов при перетаскивании
         self.scrubber.sliderMoved.connect(self.on_scrubber_change)
-
         ml.addWidget(self.scrubber)
 
         self.timeline = TimelineWidget()
@@ -456,8 +470,6 @@ class ProSportsAnalyzer(QMainWindow):
         self.update_ui_marker_controls()
 
     def fix_focus_policies(self):
-        # Используем ClickFocus, чтобы кнопки можно было нажимать мышью,
-        # но они не захватывали фокус при нажатии Tab.
         for btn in self.findChildren(QPushButton):
             btn.setFocusPolicy(Qt.ClickFocus)
         self.scrubber.setFocusPolicy(Qt.NoFocus)
@@ -1145,19 +1157,24 @@ class ProSportsAnalyzer(QMainWindow):
             or self.rgb_buffer_shape[0] != target_h
             or self.rgb_buffer_shape[1] != target_w
         ):
+            self.bgr_buffer = np.zeros((target_h, target_w, 3), dtype=np.uint8)
             self.rgb_buffer = np.zeros((target_h, target_w, 3), dtype=np.uint8)
             self.rgb_buffer_shape = (target_h, target_w, 3)
 
         try:
-            # Декодирование и изменение разрешения происходят НАПРЯМУЮ в наш статический буфер в ОЗУ
-            cv2.resize(
-                cropped, (target_w, target_h), dst=self.rgb_buffer, interpolation=interp
+            # ОПТИМИЗАЦИЯ: Исправляем перезапись NumPy буферов, всегда переназначая возвращаемый объект.
+            # Изменение разрешения BGR кадра прямиком в bgr_buffer (0 аллокаций)
+            self.bgr_buffer = cv2.resize(
+                cropped, (target_w, target_h), dst=self.bgr_buffer, interpolation=interp
+            )
+            # Конвертация цвета BGR -> RGB прямиком в rgb_buffer (0 аллокаций). ЭТО ВЕРНЕТ ПРАВИЛЬНЫЕ ЦВЕТА.
+            self.rgb_buffer = cv2.cvtColor(
+                self.bgr_buffer, cv2.COLOR_BGR2RGB, dst=self.rgb_buffer
             )
         except cv2.error:
             return
 
-        # Фоновый поток шлет кадры уже в RGB формате, поэтому мы избегаем вызова cv2.cvtColor
-        # и напрямую по ссылке на память буфера создаем QImage без выделения RAM
+        # Создаем QImage, который ссылается на статичную память, никаких переполнений RAM
         qimg = QImage(
             self.rgb_buffer.data, target_w, target_h, 3 * target_w, QImage.Format_RGB888
         )
@@ -1228,7 +1245,7 @@ class ProSportsAnalyzer(QMainWindow):
             eng = self.thread.engine
             rect_w = bar_w / (range_val * 2)
 
-            # Получаем потокобезопасную копию множества ключей кэша (0 фризов, 0 вылетов по RuntimeError)
+            # Безопасное чтение ключей из кэша (0 фризов, 0 ошибок RuntimeError)
             cached_keys = eng.get_cached_set()
 
             for offset in range(-range_val, range_val):
