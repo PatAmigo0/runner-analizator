@@ -578,8 +578,9 @@ class ProSportsAnalyzer(QMainWindow):
             self.current_marker_color = c
         self.update_ui_marker_controls()
 
-    def update_marker_props_live(self):
-        t = self.inp_tag.text()
+    def update_marker_props_live(self, text=""):
+        t = text if text else self.inp_tag.text()
+
         idx = self.timeline.selected_marker_idx
         if idx != -1 and idx < len(self.state.markers):
             self.state.markers[idx]["tag"] = t
