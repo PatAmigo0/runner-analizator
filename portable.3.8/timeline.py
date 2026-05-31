@@ -1,5 +1,5 @@
 from PySide2.QtCore import QPointF, QRectF, Qt, Signal
-from PySide2.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
+from PySide2.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QPolygonF
 from PySide2.QtWidgets import QWidget
 
 
@@ -11,8 +11,6 @@ class TimelineWidget(QWidget):
 
     def __init__(self):
         super().__init__()
-        # ОПТИМИЗАЦИЯ ИНТЕРФЕЙСА: Снижаем высоту со 140 до 115, чтобы сэкономить
-        # вертикальное пространство и предотвратить обрезание элементов в Qt Layout.
         self.setFixedHeight(115)
         self.setMouseTracking(True)
 
@@ -39,6 +37,10 @@ class TimelineWidget(QWidget):
         self.view_start = 0.0
         self.view_length = 100.0
 
+        # --- ОПТИМИЗАЦИЯ: Двойная буферизация ---
+        self._bg_pixmap = None
+        self._bg_dirty = True
+
     def set_data(self, total_frames, fps, segments, markers):
         self.total_frames = max(1, total_frames)
         self.fps = fps
@@ -48,18 +50,20 @@ class TimelineWidget(QWidget):
         self.view_start = 0.0
         self.view_length = float(self.total_frames)
 
+        self._bg_dirty = True  # Данные изменились, нужна перерисовка фона
         self.update()
         self.emit_view_changed()
 
     def set_current_frame(self, frame):
         self.current_frame = frame
-
         if self.view_length < self.total_frames:
             view_end = self.view_start + self.view_length
             if frame >= view_end:
                 self.view_start = frame - self.view_length + (self.view_length * 0.05)
+                self._bg_dirty = True
             elif frame < self.view_start:
                 self.view_start = frame - (self.view_length * 0.05)
+                self._bg_dirty = True
 
             if self.view_start < 0:
                 self.view_start = 0.0
@@ -68,20 +72,21 @@ class TimelineWidget(QWidget):
                 if self.view_start < 0:
                     self.view_start = 0.0
 
-            self.emit_view_changed()
+            if self._bg_dirty:
+                self.emit_view_changed()
 
-        self.update()
+        self.update()  # Обновляем только Playhead (зеленую линию)
 
     def set_merge_mode(self, active):
         self.merge_mode = active
         self.merge_candidates = []
+        self._bg_dirty = True
         self.update()
 
     def frame_to_pixel(self, frame):
         width = self.width() - (self.margin_left + self.margin_right)
         if self.view_length <= 0:
             return self.margin_left
-
         ratio = (frame - self.view_start) / self.view_length
         return self.margin_left + ratio * width
 
@@ -89,10 +94,8 @@ class TimelineWidget(QWidget):
         width = self.width() - (self.margin_left + self.margin_right)
         if width <= 0:
             return 0
-
         ratio = (x - self.margin_left) / width
         frame = self.view_start + ratio * self.view_length
-        # Clamp to total_frames - 1 to avoid IndexError
         return int(max(0, min(frame, self.total_frames - 1)))
 
     def emit_view_changed(self):
@@ -106,7 +109,12 @@ class TimelineWidget(QWidget):
             self.view_start = 0
         if self.view_start + self.view_length > self.total_frames:
             self.view_start = self.total_frames - self.view_length
+        self._bg_dirty = True
         self.update()
+
+    def resizeEvent(self, event):
+        self._bg_dirty = True
+        super().resizeEvent(event)
 
     def wheelEvent(self, event):
         angle = event.angleDelta().y()
@@ -114,7 +122,6 @@ class TimelineWidget(QWidget):
             return
 
         zoom_factor = 0.9 if angle > 0 else 1.1
-
         mx = event.pos().x()
         width = self.width() - (self.margin_left + self.margin_right)
         if width <= 0:
@@ -122,7 +129,6 @@ class TimelineWidget(QWidget):
 
         ratio = (mx - self.margin_left) / width
         cursor_frame = self.view_start + ratio * self.view_length
-
         new_length = self.view_length * zoom_factor
 
         if new_length < 10:
@@ -131,7 +137,6 @@ class TimelineWidget(QWidget):
             new_length = float(self.total_frames)
 
         new_start = cursor_frame - ratio * new_length
-
         if new_start < 0:
             new_start = 0
         if new_start + new_length > self.total_frames:
@@ -142,11 +147,16 @@ class TimelineWidget(QWidget):
         self.view_start = new_start
         self.view_length = new_length
 
+        self._bg_dirty = True
         self.update()
         self.emit_view_changed()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
+    def _draw_background_to_pixmap(self):
+        """Отрисовывает всю статику (фон, сегменты, маркеры) в кэш"""
+        self._bg_pixmap = QPixmap(self.size())
+        self._bg_pixmap.fill(Qt.transparent)
+
+        painter = QPainter(self._bg_pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
 
         bg_color = QColor("#111") if self.merge_mode else QColor("#222")
@@ -155,36 +165,42 @@ class TimelineWidget(QWidget):
         visible_min = self.view_start - self.view_length * 0.1
         visible_max = self.view_start + self.view_length * 1.1
 
+        # SEGMENTS
         for idx, seg in enumerate(self.segments):
             if seg["end"] < visible_min or seg["start"] > visible_max:
                 continue
 
             x1 = self.frame_to_pixel(seg["start"])
             x2 = self.frame_to_pixel(seg["end"])
-
-            w = x2 - x1
-            if w < 1:
-                w = 1
-
+            w = max(1, x2 - x1)
             rect = QRectF(x1, self.track_y, w, self.track_height)
 
             if self.merge_mode:
                 if idx in self.merge_candidates:
-                    fill_color = QColor("#00aa00")
-                    border_color = QColor("#fff")
+                    fill_color, border_color, thickness = (
+                        QColor("#00aa00"),
+                        QColor("#fff"),
+                        2,
+                    )
                 else:
-                    fill_color = QColor("#333")
-                    border_color = QColor("#555")
-                thickness = 2
+                    fill_color, border_color, thickness = (
+                        QColor("#333"),
+                        QColor("#555"),
+                        2,
+                    )
             else:
                 if idx == self.selected_segment_idx:
-                    fill_color = QColor("#d4a017")
-                    border_color = QColor("#fff")
-                    thickness = 2
+                    fill_color, border_color, thickness = (
+                        QColor("#d4a017"),
+                        QColor("#fff"),
+                        2,
+                    )
                 else:
-                    fill_color = QColor("#444")
-                    border_color = QColor("#666")
-                    thickness = 1
+                    fill_color, border_color, thickness = (
+                        QColor("#444"),
+                        QColor("#666"),
+                        1,
+                    )
 
             painter.setBrush(QBrush(fill_color))
             painter.setPen(QPen(border_color, thickness))
@@ -194,6 +210,7 @@ class TimelineWidget(QWidget):
                 painter.setPen(QColor("#fff"))
                 painter.drawText(rect, Qt.AlignCenter, f"S{idx + 1}")
 
+        # MARKERS
         if not self.merge_mode:
             font_tag = QFont("Arial", 9, QFont.Bold)
             painter.setFont(font_tag)
@@ -201,19 +218,18 @@ class TimelineWidget(QWidget):
             for i, m in enumerate(self.markers):
                 if not m.get("visible", True):
                     continue
-
                 if m["frame"] < visible_min or m["frame"] > visible_max:
                     continue
 
                 mx = self.frame_to_pixel(m["frame"])
                 base_y = self.track_y + self.track_height
-
                 color = QColor(m.get("color", "#ff0000"))
 
-                if i == self.selected_marker_idx:
-                    pen = QPen(Qt.white, 2)
-                else:
-                    pen = QPen(color.darker(150), 1)
+                pen = (
+                    QPen(Qt.white, 2)
+                    if i == self.selected_marker_idx
+                    else QPen(color.darker(150), 1)
+                )
 
                 painter.setPen(QPen(color, 1, Qt.DashLine))
                 painter.drawLine(int(mx), int(self.track_y), int(mx), int(base_y))
@@ -221,10 +237,7 @@ class TimelineWidget(QWidget):
                 painter.setBrush(QBrush(color))
                 painter.setPen(pen)
 
-                # Масштабируем маркеры под новую высоту виджета
-                tri_w = 10
-                tri_h = 20
-
+                tri_w, tri_h = 10, 20
                 polygon = QPolygonF(
                     [
                         QPointF(mx, base_y - 3),
@@ -236,19 +249,36 @@ class TimelineWidget(QWidget):
 
                 tag = m.get("tag", "")
                 if tag:
-                    letter = tag[0].upper()
                     text_rect = QRectF(mx - tri_w, base_y + 1, tri_w * 2, tri_h)
                     painter.setPen(QColor("#ffffff"))
-                    painter.drawText(text_rect, Qt.AlignCenter, letter)
+                    painter.drawText(text_rect, Qt.AlignCenter, tag[0].upper())
+        painter.end()
 
+    def paintEvent(self, event):
+        painter = QPainter(self)
+
+        # Если данные изменились или размер поменялся - перерисовываем фон
+        if (
+            self._bg_dirty
+            or self._bg_pixmap is None
+            or self._bg_pixmap.size() != self.size()
+        ):
+            self._draw_background_to_pixmap()
+            self._bg_dirty = False
+
+        # Рисуем статичный кэшированный фон
+        painter.drawPixmap(0, 0, self._bg_pixmap)
+
+        # Динамически рисуем только ползунок (очень быстрая операция)
+        visible_min = self.view_start - self.view_length * 0.1
+        visible_max = self.view_start + self.view_length * 1.1
         if visible_min <= self.current_frame <= visible_max:
             cx = self.frame_to_pixel(self.current_frame)
             painter.setPen(QPen(QColor("#00ff00"), 2))
             painter.drawLine(int(cx), 0, int(cx), self.height())
 
     def mousePressEvent(self, event):
-        x = event.pos().x()
-        y = event.pos().y()
+        x, y = event.pos().x(), event.pos().y()
         frame = self.pixel_to_frame(x)
 
         if self.merge_mode:
@@ -274,6 +304,7 @@ class TimelineWidget(QWidget):
                         self.selected_segment_idx = -1
                         self.drag_mode = "move_marker"
                         self.drag_target_idx = i
+                        self._bg_dirty = True
                         self.update()
                         self.marker_selected.emit(i)
                         self.segment_selected.emit(-1)
@@ -286,25 +317,26 @@ class TimelineWidget(QWidget):
                     self.selected_marker_idx = -1
                     self.segment_selected.emit(i)
                     self.marker_selected.emit(-1)
+                    self._bg_dirty = True
                     self.update()
                     return
 
         self.seek_requested.emit(frame)
-        self.update()
 
     def mouseMoveEvent(self, event):
         if self.merge_mode:
             return
 
-        x = event.pos().x()
-        y = event.pos().y()
+        x, y = event.pos().x(), event.pos().y()
         frame = self.pixel_to_frame(x)
 
         if self.drag_mode and self.drag_target_idx != -1:
-            if self.drag_mode == "move_marker":
-                if self.drag_target_idx < len(self.markers):
-                    self.markers[self.drag_target_idx]["frame"] = frame
-                    self.seek_requested.emit(frame)
+            if self.drag_mode == "move_marker" and self.drag_target_idx < len(
+                self.markers
+            ):
+                self.markers[self.drag_target_idx]["frame"] = frame
+                self.seek_requested.emit(frame)
+                self._bg_dirty = True
 
             self.update()
             if "seg" in self.drag_mode:
@@ -318,8 +350,7 @@ class TimelineWidget(QWidget):
             for m in self.markers:
                 if not m.get("visible", True):
                     continue
-                mx = self.frame_to_pixel(m["frame"])
-                if abs(x - mx) < 15:
+                if abs(x - self.frame_to_pixel(m["frame"])) < 15:
                     self.setCursor(Qt.PointingHandCursor)
                     return
 
@@ -328,5 +359,10 @@ class TimelineWidget(QWidget):
     def mouseReleaseEvent(self, event):
         if self.drag_mode == "move_marker":
             self.markers.sort(key=lambda x: x["frame"])
+            self._bg_dirty = True
+            self.update()
         self.drag_mode = None
         self.drag_target_idx = -1
+
+    # В main.py везде, где вызывается self.timeline.update() для сегментов/маркеров,
+    # теперь нужно вызывать self.timeline._bg_dirty = True перед update().

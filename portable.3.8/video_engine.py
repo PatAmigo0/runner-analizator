@@ -3,13 +3,15 @@
 import gc
 import glob
 import os
-import time
+import re
+import subprocess
 from collections import deque
 
 import cv2
 from PySide2.QtCore import QThread, Signal
 
 from logger import Logger
+from utils import get_resource_path
 
 # Попытка импортировать PyAV для супер-быстрой и точной перемотки оригинальных MP4/MKV
 try:
@@ -18,6 +20,7 @@ try:
     HAS_PYAV = True
 except ImportError:
     HAS_PYAV = False
+
 
 IS_DEBUG = "__compiled__" not in globals()
 logger = Logger(IS_DEBUG)
@@ -35,115 +38,129 @@ class ProxyGeneratorThread(QThread):
         self.codec = codec
         self.target_height = target_height
         self._is_running = True
+        self.process = None
 
     def run(self):
-        cap = cv2.VideoCapture(self.input_path, cv2.CAP_ANY)
-        if not cap.isOpened():
-            logger.file(f"Critical: Failed to open source for proxy: {self.input_path}")
-            self.finished_signal.emit(False, "")
-            return
+        # 1. Получаем общее количество кадров для прогресс-бара
+        cap = cv2.VideoCapture(self.input_path)
+        total_frames = 1
+        if cap.isOpened():
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
 
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if total_frames <= 0:
+            total_frames = 1
 
-        # Расчет размера
-        if self.target_height > 0 and height > self.target_height:
-            new_height = self.target_height
-            ratio = new_height / height
-            new_width = int(width * ratio)
-        else:
-            new_height = height
-            new_width = width
+        # 2. Формируем команду FFmpeg
+        # scale=-2:540 (сохраняет пропорции, делает ширину четной, высота 540)
+        vf_scale = f"scale=-2:{self.target_height}"
 
-        # Ensure dimensions are even for codecs
-        if new_width % 2 != 0:
-            new_width += 1
-        if new_height % 2 != 0:
-            new_height += 1
-
-        write_fps = round(fps)
-        if write_fps <= 0:
-            write_fps = 30
-        if write_fps > 60:
-            write_fps = 60
-
-        # Выбор FOURCC
+        # Подбираем энкодер
         if self.codec == "MJPG":
-            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        elif self.codec == "mp4v":
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        elif self.codec == "avc1":
-            fourcc = cv2.VideoWriter_fourcc(*"avc1")
+            vcodec = "mjpeg"
+            extra_args = ["-q:v", "3"]  # Качество для mjpeg
         elif self.codec == "hevc":
-            fourcc = cv2.VideoWriter_fourcc(*"HEVC")
-        else:
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            vcodec = "libx265"
+            extra_args = ["-preset", "fast", "-crf", "26"]
+        else:  # avc1 / mp4v -> H.264
+            vcodec = "libx264"
+            extra_args = ["-preset", "veryfast", "-crf", "23"]
 
-        out = cv2.VideoWriter(
-            self.output_path, fourcc, write_fps, (new_width, new_height)
+        ffmpeg_path = get_resource_path("ffmpeg.exe")
+
+        cmd = (
+            [
+                ffmpeg_path,
+                "-y",
+                "-hwaccel",
+                "auto",
+                "-i",
+                self.input_path,
+                "-vf",
+                vf_scale,
+                "-c:v",
+                vcodec,
+            ]
+            + extra_args
+            + ["-an", self.output_path]
         )
 
-        # Fallback, если кодек не открылся
-        if not out.isOpened():
-            logger.file(f"Codec {self.codec} failed. Fallback to mp4v.")
-            root, _ = os.path.splitext(self.output_path)
-            self.output_path = root + ".mp4"
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out = cv2.VideoWriter(
-                self.output_path, fourcc, write_fps, (new_width, new_height)
+        try:
+            # Запускаем ffmpeg, перехватывая stderr, куда он пишет прогресс
+            self.process = subprocess.Popen(
+                cmd,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
-            if not out.isOpened():
-                logger.file("Critical: Fallback codec also failed.")
-                cap.release()
+
+            # Регулярка для поиска слова "frame=  123" в выводе FFmpeg
+            frame_regex = re.compile(r"frame=\s*(\d+)")
+
+            for line in self.process.stderr:
+                if not self._is_running:
+                    self.process.terminate()
+                    break
+
+                match = frame_regex.search(line)
+                if match:
+                    current_frame = int(match.group(1))
+                    percent = int((current_frame / total_frames) * 100)
+                    self.progress_signal.emit(min(percent, 100))
+
+            self.process.wait()
+
+            if self._is_running and self.process.returncode == 0:
+                self.progress_signal.emit(100)
+                self.finished_signal.emit(True, self.output_path)
+            else:
+                # Если прервали или ошибка
+                if os.path.exists(self.output_path):
+                    try:
+                        os.remove(self.output_path)
+                    except:
+                        pass
                 self.finished_signal.emit(False, "")
-                return
 
-        start_time = time.time()
-        count = 0
-        while self._is_running:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            try:
-                if new_height != height or new_width != width:
-                    resized = cv2.resize(
-                        frame, (new_width, new_height), interpolation=cv2.INTER_AREA
-                    )
-                    out.write(resized)
-                else:
-                    out.write(frame)
-            except Exception as e:
-                logger.file(f"Proxy gen error at frame {count}: {e}")
-
-            count += 1
-            if total > 0 and count % 10 == 0:
-                percent = int((count / total) * 100)
-                self.progress_signal.emit(percent)
-                if count % 100 == 0:
-                    dt = time.time() - start_time
-                    if dt > 0:
-                        perf_fps = count / dt
-                        logger.debug(
-                            f"Encoding {self.codec}: {percent}% @ {perf_fps:.1f} FPS"
-                        )
-
-        cap.release()
-        out.release()
-
-        if self._is_running:
-            self.finished_signal.emit(True, self.output_path)
-        else:
-            if os.path.exists(self.output_path):
-                try:
-                    os.remove(self.output_path)
-                except OSError:
-                    pass
+        except FileNotFoundError:
+            logger.file(
+                "FFmpeg не найден в системе! Пожалуйста, скачайте ffmpeg.exe и положите рядом с программой."
+            )
+            self.finished_signal.emit(False, "")
+        except Exception as e:
+            logger.file(f"Proxy generation failed: {e}")
             self.finished_signal.emit(False, "")
 
     def stop(self):
-        self._is_running = False
+        self.set_playing(False)
+        self._run_flag = False
+
+        # принудительно будим поток, если он уснул в ожидании кэширования,
+        self.state_mutex.lock()
+        try:
+            self.wait_condition.wakeAll()
+        finally:
+            self.state_mutex.unlock()
+
+        # ждем штатного завершения (1 секунда)
+        self.wait(1000)
+
+        # терминируем только в крайнем случае
+        if self.isRunning():
+            self.terminate()
+            self.wait()
+
+    def full_release(self):
+        self.stop()
+
+        # Пробуем захватить мьютекс, но если он заблокировался из-за terminate(),
+        # то просто игнорируем, чтобы не вызвать белый экран (deadlock).
+        locked = self.engine_mutex.tryLock(500)
+        try:
+            self.engine.release()
+        finally:
+            if locked:
+                self.engine_mutex.unlock()
 
 
 # --- VIDEO ENGINE ---
