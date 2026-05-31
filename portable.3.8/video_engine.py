@@ -7,11 +7,19 @@ import time
 from collections import deque
 
 import cv2
-from logger import Logger
 from PySide2.QtCore import QThread, Signal
 
-IS_DEBUG = "__compiled__" not in globals()
+from logger import Logger
 
+# Попытка импортировать PyAV для супер-быстрой и точной перемотки оригинальных MP4/MKV
+try:
+    import av
+
+    HAS_PYAV = True
+except ImportError:
+    HAS_PYAV = False
+
+IS_DEBUG = "__compiled__" not in globals()
 logger = Logger(IS_DEBUG)
 
 
@@ -49,7 +57,7 @@ class ProxyGeneratorThread(QThread):
             new_height = height
             new_width = width
 
-        # [FIX] Ensure dimensions are even for codecs
+        # Ensure dimensions are even for codecs
         if new_width % 2 != 0:
             new_width += 1
         if new_height % 2 != 0:
@@ -143,6 +151,13 @@ class VideoEngine:
     def __init__(self, settings_manager):
         self.settings = settings_manager
         self.cap = None
+
+        # Двухдвижковая структура: PyAV (FFmpeg) и OpenCV
+        self.av_container = None
+        self.av_stream = None
+        self.av_frame_generator = None
+        self.is_av_active = False
+
         self.total_frames = 0
         self.fps = 30.0
         self.width = 0
@@ -152,7 +167,13 @@ class VideoEngine:
         self.original_path = ""
         self.proxy_path = ""
 
-        self.CACHE_SIZE = self.settings.get("cache_size", 100)
+        # Ограничиваем кэш на 32-битных системах во избежание MemoryError
+        import struct
+
+        is_32bit = struct.calcsize("P") == 4
+        max_allowed_cache = 120 if is_32bit else 300
+
+        self.CACHE_SIZE = min(self.settings.get("cache_size", 100), max_allowed_cache)
         self.use_gpu = self.settings.get("use_gpu", False)
 
         self.cache = deque(maxlen=self.CACHE_SIZE)
@@ -162,7 +183,12 @@ class VideoEngine:
         self.is_fast_seek = False
 
     def update_settings_live(self):
-        new_cache = self.settings.get("cache_size", 100)
+        import struct
+
+        is_32bit = struct.calcsize("P") == 4
+        max_allowed_cache = 120 if is_32bit else 300
+
+        new_cache = min(self.settings.get("cache_size", 100), max_allowed_cache)
         if new_cache != self.CACHE_SIZE:
             self.CACHE_SIZE = new_cache
             old_data = list(self.cache)
@@ -224,12 +250,61 @@ class VideoEngine:
 
     def load_internal(self, path):
         self.full_stop()
-        backend_name = self.settings.get("video_backend", "AUTO")
 
-        # Строгий выбор API без fallbacks на этапе инициализации
+        # Для прокси-файлов (обычно AVI / MJPEG) OpenCV идеален, так как каждый кадр ключевой.
+        # Для оригинальных тяжелых MP4 используем PyAV (FFmpeg C-level) для аппаратной скорости.
+        is_proxy_file = "proxy" in os.path.basename(
+            path
+        ).lower() or path.lower().endswith(".avi")
+
+        if HAS_PYAV and not is_proxy_file:
+            try:
+                self.av_container = av.open(path)
+                self.av_stream = self.av_container.streams.video[0]
+                # Включаем многопоточное декодирование силами FFmpeg!
+                self.av_stream.thread_type = "AUTO"
+
+                # Читаем параметры
+                self.fps = (
+                    float(self.av_stream.average_rate)
+                    if self.av_stream.average_rate
+                    else 30.0
+                )
+                self.width = self.av_stream.width
+                self.height = self.av_stream.height
+                self.total_frames = self.av_stream.frames
+
+                if self.total_frames <= 0:
+                    # Резервный расчет по длительности
+                    duration = self.av_container.duration
+                    if duration:
+                        self.total_frames = int((duration / 1000000.0) * self.fps)
+                    else:
+                        self.total_frames = 0
+
+                self.is_av_active = True
+                self.current_frame_index = -1
+                self.cache.clear()
+                self.cache_index_map.clear()
+                self.av_frame_generator = None
+
+                logger.debug(
+                    f"PyAV SUCCESS: Opened {path}. {self.width}x{self.height} @ {self.fps:.2f}fps, total frames: {self.total_frames}"
+                )
+                return True
+            except Exception as e:
+                logger.debug(
+                    f"PyAV failed to load {path}. Fallback to OpenCV. Error: {e}"
+                )
+                self.is_av_active = False
+                if self.av_container:
+                    self.av_container.close()
+                    self.av_container = None
+
+        # --- OPENCV FALLBACK / PROXY BACKEND ---
+        backend_name = self.settings.get("video_backend", "AUTO")
         selected_api = cv2.CAP_ANY
         if backend_name != "AUTO":
-            # Ищем точное совпадение имени константы
             const_name = f"CAP_{backend_name}"
             if hasattr(cv2, const_name):
                 selected_api = getattr(cv2, const_name)
@@ -242,7 +317,6 @@ class VideoEngine:
         logger.debug(
             f"Attempting to open video with API: {backend_name} (Val: {selected_api})"
         )
-
         self.cap = cv2.VideoCapture(path, selected_api)
 
         if not self.cap.isOpened():
@@ -253,13 +327,11 @@ class VideoEngine:
                 self.cap = cv2.VideoCapture(path, cv2.CAP_ANY)
 
         if self.cap.isOpened():
-            # --- REAL DEBUGGING ---
             real_backend = self.cap.getBackendName()
             logger.debug(
                 f"SUCCESS: Video opened. Requested: {backend_name} -> Actual: {real_backend}"
             )
 
-            # --- ЛОГИКА АППАРАТНОГО УСКОРЕНИЯ ---
             if self.use_gpu:
                 backends_to_try = []
                 if hasattr(cv2, "VIDEO_ACCELERATION_D3D11"):
@@ -314,15 +386,14 @@ class VideoEngine:
         logger.file("CRITICAL: Failed to open video with any backend.")
         return False
 
+    def clear_av_generator(self):
+        self.av_frame_generator = None
+
     def generate_proxy_path(self, original_path, quality):
         filename = os.path.basename(original_path)
         name, _ = os.path.splitext(filename)
         ext = self.settings.get_proxy_extension()
         return os.path.join(self.settings.proxies_dir, f"{name}_proxy_{quality}p{ext}")
-
-    def get_proxy_filename(self, path):
-        qual = self.settings.get("proxy_quality", 540)
-        return self.generate_proxy_path(path, qual)
 
     def find_existing_proxy(self, original_path):
         if not original_path:
@@ -351,11 +422,47 @@ class VideoEngine:
                 if oldest_idx in self.cache_index_map:
                     del self.cache_index_map[oldest_idx]
 
+            # Оптимизация аллокации: копируем кадр только если нужно сохранить в кэше
             frame_copy = frame.copy()
             self.cache.append((idx, frame_copy))
             self.cache_index_map[idx] = frame_copy
 
+    def get_cached_set(self):
+        # Возвращаем копию множества ключей кэша для безопасного чтения из UI-потока
+        return set(self.cache_index_map.keys())
+
     def read(self):
+        if self.is_av_active:
+            try:
+                if self.av_frame_generator is None:
+                    self.av_frame_generator = self.av_container.decode(video=0)
+
+                frame = next(self.av_frame_generator)
+                if frame.pts is not None:
+                    pts_time = float(frame.pts * self.av_stream.time_base)
+                    pos = int(round(pts_time * self.fps))
+                else:
+                    pos = (
+                        frame.index
+                        if frame.index is not None
+                        else self.current_frame_index + 1
+                    )
+
+                pos = max(0, min(pos, self.total_frames - 1))
+                frame_bgr = frame.to_ndarray(format="bgr24")
+
+                self.current_frame_index = pos
+                self._update_cache(pos, frame_bgr)
+                return True, frame_bgr, pos
+            except StopIteration:
+                self.av_frame_generator = None
+                return False, None, self.current_frame_index
+            except Exception as e:
+                logger.debug(f"PyAV read error: {e}. Resetting generator.")
+                self.av_frame_generator = None
+                return False, None, self.current_frame_index
+
+        # --- OpenCV Read ---
         if not self.cap or not self.cap.isOpened():
             return False, None, self.current_frame_index
 
@@ -371,14 +478,65 @@ class VideoEngine:
         return False, None, self.current_frame_index
 
     def seek(self, target_frame):
-        if not self.cap or not self.cap.isOpened():
-            return False, None, -1
-
         target_frame = max(0, min(target_frame, self.total_frames - 1))
 
         if target_frame in self.cache_index_map:
             self.current_frame_index = target_frame
             return True, self.cache_index_map[target_frame], target_frame
+
+        # --- PyAV Seek ---
+        if self.is_av_active:
+            self.clear_av_generator()
+            stream = self.av_stream
+            time_base = stream.time_base
+
+            # Рассчитываем точное смещение в единицах time_base
+            target_sec = target_frame / self.fps
+            target_ts = int(target_sec / time_base)
+
+            try:
+                # Перемещаемся аппаратно к ключевому кадру (Keyframe) ДО целевой позиции
+                self.av_container.seek(target_ts, stream=stream)
+
+                found_frame = None
+                self.av_frame_generator = self.av_container.decode(video=0)
+
+                # Декодируем вперед до целевого кадра, параллельно забивая кэш
+                for frame in self.av_frame_generator:
+                    if frame.pts is not None:
+                        pts_time = float(frame.pts * time_base)
+                        current_idx = int(round(pts_time * self.fps))
+                    else:
+                        current_idx = frame.index if frame.index is not None else 0
+
+                    current_idx = max(0, min(current_idx, self.total_frames - 1))
+                    frame_bgr = frame.to_ndarray(format="bgr24")
+                    self._update_cache(current_idx, frame_bgr)
+
+                    if current_idx == target_frame:
+                        found_frame = frame_bgr
+                        self.current_frame_index = target_frame
+                        break
+                    elif current_idx > target_frame:
+                        # Если случайно пролетели мимо целевого из-за особенностей контейнера
+                        found_frame = frame_bgr
+                        self.current_frame_index = current_idx
+                        break
+
+                if found_frame is not None:
+                    return True, found_frame, self.current_frame_index
+            except Exception as e:
+                logger.debug(f"PyAV Seek failed: {e}. Reinitializing container.")
+                try:
+                    self.av_container = av.open(self.original_path)
+                    self.av_stream = self.av_container.streams.video[0]
+                    self.av_stream.thread_type = "AUTO"
+                except:
+                    pass
+
+        # --- OpenCV Seek Fallback ---
+        if not self.cap or not self.cap.isOpened():
+            return False, None, -1
 
         diff = target_frame - self.current_frame_index
         if 0 < diff <= 10:
@@ -395,8 +553,6 @@ class VideoEngine:
                     self.cache_index_map[self.current_frame_index],
                     self.current_frame_index,
                 )
-
-        t0 = time.time()
 
         if self.smart_seek_lookback == 0:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
@@ -423,9 +579,6 @@ class VideoEngine:
 
             if found_frame is not None:
                 self.current_frame_index = target_frame
-                dt = time.time() - t0
-                if dt > 0.1:
-                    logger.debug(f"Seek lag: {dt:.3f}s (Target: {target_frame})")
                 return True, found_frame, target_frame
 
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
@@ -439,7 +592,17 @@ class VideoEngine:
         if self.cap:
             self.cap.release()
             self.cap = None
-        # Force Garbage Collection to release Windows file locks
+        if self.av_container:
+            try:
+                self.av_container.close()
+            except:
+                pass
+            self.av_container = None
+            self.av_stream = None
+            self.av_frame_generator = None
+            self.is_av_active = False
+
+        # Форсированный сборщик мусора для освобождения дескрипторов файлов Windows
         gc.collect()
 
     def release(self):
