@@ -4,26 +4,34 @@ import glob
 import json
 import os
 import time
+import traceback  # Добавлено для отладки
 
 from PySide2.QtCore import QStandardPaths, Qt
 
 
 class SettingsManager:
     def __init__(self):
+        # ИСПРАВЛЕНИЕ: Используем AppDataLocation вместо ConfigLocation или текущей папки.
+        # Это гарантирует, что у скомпилированного .exe будут права на запись.
         try:
-            config_path = QStandardPaths.writableLocation(
-                QStandardPaths.AppConfigLocation
-            )
-            self.app_dir = os.path.join(config_path, "ProSportsAnalyzer")
+            base_path = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+            self.app_dir = os.path.join(base_path, "ProSportsAnalyzer")
             if not os.path.exists(self.app_dir):
                 os.makedirs(self.app_dir)
-        except Exception:
+        except Exception as e:
+            print(f"Error creating AppData directory: {e}")
+            # Fallback (крайний случай)
             self.app_dir = os.getcwd()
 
         self.filepath = os.path.join(self.app_dir, "settings.json")
         self.proxies_dir = os.path.join(self.app_dir, "proxies")
+
+        # Создаем папку прокси, если нет
         if not os.path.exists(self.proxies_dir):
-            os.makedirs(self.proxies_dir)
+            try:
+                os.makedirs(self.proxies_dir)
+            except OSError:
+                pass
 
         self.default_hotkeys = {
             "play_pause": int(Qt.Key_Space),
@@ -86,11 +94,16 @@ class SettingsManager:
                 print(f"Error loading settings: {e}")
 
     def save(self):
+        # ИСПРАВЛЕНИЕ: Добавлен try/except для отладки ошибок записи
         try:
             with open(self.filepath, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=4)
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            print(f"CRITICAL ERROR SAVING SETTINGS: {e}")
+            traceback.print_exc()
+            # В реальном приложении можно было бы выбросить исключение выше,
+            # чтобы GUI показал ошибку, но пока просто логируем в консоль.
+            raise e
 
     def get(self, key, default=None):
         return self.data["general"].get(key, default)
@@ -141,8 +154,10 @@ class SettingsManager:
 
     def clear_all_proxies(self):
         try:
-            # Убран naked time.sleep(0.2)
             success = True
+            if not os.path.exists(self.proxies_dir):
+                return True
+
             for filename in os.listdir(self.proxies_dir):
                 file_path = os.path.join(self.proxies_dir, filename)
                 if os.path.isfile(file_path) or os.path.islink(file_path):

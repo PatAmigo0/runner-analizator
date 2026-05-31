@@ -1,6 +1,7 @@
 # type: ignore
 
 import os
+import traceback
 
 import cv2
 from PySide2.QtCore import Qt
@@ -25,6 +26,11 @@ from PySide2.QtWidgets import (
     QVBoxLayout,
 )
 from utils import apply_dark_title_bar, create_dark_msg_box, normalize_key
+
+try:
+    from video_engine import logger
+except ImportError:
+    logger = None
 
 DIALOG_STYLESHEET = """
     QDialog { 
@@ -148,7 +154,8 @@ class HotkeyEditor(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.doubleClicked.connect(self.start_recording)
+        # Lambda fix
+        self.table.doubleClicked.connect(lambda idx: self.start_recording(idx))
 
         self.action_names = {
             "play_pause": "Старт/Пауза",
@@ -237,7 +244,7 @@ class GeneralSettingsDialog(QDialog):
         self.current_proxy_path = current_proxy_path
         self.current_video_path = current_video_path
         self.setWindowTitle("Настройки")
-        self.resize(550, 750)  # Slightly taller
+        self.resize(550, 750)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         apply_dark_title_bar(self)
         self.setStyleSheet(DIALOG_STYLESHEET)
@@ -274,7 +281,6 @@ class GeneralSettingsDialog(QDialog):
         self.cb_ask_proxy.setCursor(Qt.PointingHandCursor)
         form.addRow(self.cb_ask_proxy)
 
-        # --- NEW PROXY LOCATION LABEL ---
         lbl_loc = QLabel("Папка хранения:")
         lbl_loc.setStyleSheet("color: #ccc;")
 
@@ -284,7 +290,6 @@ class GeneralSettingsDialog(QDialog):
             "background-color: #333; color: #aaa; border: 1px solid #444;"
         )
         form.addRow(lbl_loc, self.le_path)
-        # --------------------------------
 
         self.combo_quality = QComboBox()
         qualities = [
@@ -339,12 +344,14 @@ class GeneralSettingsDialog(QDialog):
                 QPushButton { background-color: #4a1010; border: 1px solid #700; color: #ffcccc; }
                 QPushButton:hover { background-color: #700000; border-color: #f00; }
             """)
-            btn_del.clicked.connect(self.request_delete)
+            # Lambda fix
+            btn_del.clicked.connect(lambda: self.request_delete())
             btn_del.setFocusPolicy(Qt.StrongFocus)
             main_layout.addWidget(btn_del)
 
         btn_clear_all = QPushButton("Очистить папку Proxies (Все файлы)")
-        btn_clear_all.clicked.connect(self.clear_all_proxies)
+        # Lambda fix
+        btn_clear_all.clicked.connect(lambda: self.clear_all_proxies())
         btn_clear_all.setFocusPolicy(Qt.StrongFocus)
         main_layout.addWidget(btn_clear_all)
 
@@ -400,7 +407,18 @@ class GeneralSettingsDialog(QDialog):
         main_layout.addStretch()
 
         bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bbox.accepted.connect(self.apply_settings)
+
+        # --- ЯДЕРНОЕ ИСПРАВЛЕНИЕ ДЛЯ NUITKA ---
+        # 1. Отключаем стандартный сигнал accepted, он глючит в скомпилированном виде
+        # bbox.accepted.connect(self.apply_settings) <- ЭТО БЫЛО ПРИЧИНОЙ
+
+        # 2. Получаем прямую ссылку на кнопку OK
+        btn_ok = bbox.button(QDialogButtonBox.Ok)
+        if btn_ok:
+            # 3. Используем Lambda, чтобы разорвать связь с C++ слотом и создать новый Python вызов
+            btn_ok.clicked.connect(lambda: self.apply_settings())
+
+        # Cancel работает нормально, потому что reject() встроен в Qt
         bbox.rejected.connect(self.reject)
 
         for btn in bbox.buttons():
@@ -422,7 +440,8 @@ class GeneralSettingsDialog(QDialog):
                 if main_window and hasattr(main_window, "thread"):
                     main_window.thread.full_release()
             except Exception as e:
-                print(f"Could not release video before clearing: {e}")
+                if logger:
+                    logger.error(e)
 
             if self.settings.clear_all_proxies():
                 msg_ok = create_dark_msg_box(
@@ -444,116 +463,128 @@ class GeneralSettingsDialog(QDialog):
         self.accept()
 
     def apply_settings(self):
-        new_backend_str: str = self.combo_backend.currentData()
-        old_backend: str = self.settings.get("video_backend", "AUTO")
+        try:
+            # Логируем начало, чтобы видеть, вошли ли мы в функцию
+            if logger:
+                logger.debug("Applying settings started...")
 
-        # Если меняем Backend и видео загружено - проверяем, откроется ли оно
-        if (
-            new_backend_str != old_backend
-            and self.current_video_path
-            and os.path.exists(self.current_video_path)
-        ):
-            # 1. Строгий маппинг строк на имена констант OpenCV
-            # Мы не используем getattr с дефолтом ANY, чтобы избежать самообмана
-            backend_const_name = f"CAP_{new_backend_str}"
+            new_backend_str: str = self.combo_backend.currentData()
+            old_backend: str = self.settings.get("video_backend", "AUTO")
 
-            # Исключение для AUTO
-            if new_backend_str == "AUTO":
-                selected_api = cv2.CAP_ANY
-            else:
-                # Проверяем, существует ли такая константа в текущем cv2
-                if not hasattr(cv2, backend_const_name):
+            if (
+                new_backend_str != old_backend
+                and self.current_video_path
+                and os.path.exists(self.current_video_path)
+            ):
+                backend_const_name = f"CAP_{new_backend_str}"
+
+                if new_backend_str == "AUTO":
+                    selected_api = cv2.CAP_ANY
+                else:
+                    if not hasattr(cv2, backend_const_name):
+                        msg = create_dark_msg_box(
+                            self,
+                            "Ошибка совместимости",
+                            f"Ваша версия OpenCV не поддерживает движок '{new_backend_str}'.\n"
+                            f"Константа cv2.{backend_const_name} не найдена.",
+                            QMessageBox.Critical,
+                        )
+                        msg.exec_()
+                        idx = self.combo_backend.findData(old_backend)
+                        self.combo_backend.setCurrentIndex(idx)
+                        return
+
+                    selected_api = getattr(cv2, backend_const_name)
+
+                try:
+                    cap_test = cv2.VideoCapture(self.current_video_path, selected_api)
+                    is_opened = cap_test.isOpened()
+                    real_backend = cap_test.getBackendName() if is_opened else "NONE"
+                    cap_test.release()
+
+                    if not is_opened:
+                        msg = create_dark_msg_box(
+                            self,
+                            "Ошибка открытия",
+                            f"Движок '{new_backend_str}' не смог открыть это видео.",
+                            QMessageBox.Warning,
+                        )
+                        msg.exec_()
+                        idx = self.combo_backend.findData(old_backend)
+                        self.combo_backend.setCurrentIndex(idx)
+                        return
+
+                    if (
+                        new_backend_str not in ["AUTO", "ANY"]
+                        and real_backend != new_backend_str
+                    ):
+                        msg = create_dark_msg_box(
+                            self,
+                            "Ошибка применения",
+                            f"Вы выбрали '{new_backend_str}', но OpenCV автоматически переключился на '{real_backend}'.\n"
+                            "Скорее всего, у вас не установлены необходимые библиотеки (CUDA/GStreamer) или драйверы.",
+                            QMessageBox.Warning,
+                        )
+                        msg.exec_()
+                        idx = self.combo_backend.findData(old_backend)
+                        self.combo_backend.setCurrentIndex(idx)
+                        return
+
+                except Exception as e:
+                    if logger:
+                        logger.error(e)
                     msg = create_dark_msg_box(
-                        self,
-                        "Ошибка совместимости",
-                        f"Ваша версия OpenCV не поддерживает движок '{new_backend_str}'.\n"
-                        f"Константа cv2.{backend_const_name} не найдена.",
-                        QMessageBox.Critical,
+                        self, "Ошибка", str(e), QMessageBox.Critical
                     )
                     msg.exec_()
-                    # Возврат на старое
-                    idx = self.combo_backend.findData(old_backend)
-                    self.combo_backend.setCurrentIndex(idx)
                     return
 
-                selected_api = getattr(cv2, backend_const_name)
+            self.settings.set("use_proxy", self.cb_use_proxy.isChecked())
 
-            # 2. Пробуем открыть
-            try:
-                cap_test = cv2.VideoCapture(self.current_video_path, selected_api)
-                is_opened = cap_test.isOpened()
+            ask_proxy = self.cb_ask_proxy.isChecked()
+            self.settings.set("ask_proxy_creation", ask_proxy)
 
-                # Получаем реальное имя движка, который сработал
-                real_backend = cap_test.getBackendName() if is_opened else "NONE"
-                cap_test.release()
+            new_q = self.combo_quality.currentData()
+            self.settings.set("proxy_quality", new_q)
 
-                if not is_opened:
-                    msg = create_dark_msg_box(
-                        self,
-                        "Ошибка открытия",
-                        f"Движок '{new_backend_str}' не смог открыть это видео.",
-                        QMessageBox.Warning,
-                    )
-                    msg.exec_()
-                    idx = self.combo_backend.findData(old_backend)
-                    self.combo_backend.setCurrentIndex(idx)
-                    return
+            new_codec = self.combo_codec.currentData()
+            self.settings.set("proxy_codec", new_codec)
 
-                # 3. ПРОВЕРКА НА ПОДМЕНУ (Silent Fallback)
-                # Если мы просили CUDA, а OpenCV втихую подсунул MSMF/FFMPEG - ругаемся.
-                if (
-                    new_backend_str not in ["AUTO", "ANY"]
-                    and real_backend != new_backend_str
-                ):
-                    msg = create_dark_msg_box(
-                        self,
-                        "Ошибка применения",
-                        f"Вы выбрали '{new_backend_str}', но OpenCV автоматически переключился на '{real_backend}'.\n"
-                        "Скорее всего, у вас не установлены необходимые библиотеки (CUDA/GStreamer) или драйверы.",
-                        QMessageBox.Warning,
-                    )
-                    msg.exec_()
-                    idx = self.combo_backend.findData(old_backend)
-                    self.combo_backend.setCurrentIndex(idx)
-                    return
+            self.settings.set("cache_size", self.spin_cache.value())
+            self.settings.set("use_gpu", self.cb_gpu.isChecked())
 
-            except Exception as e:
-                print(f"Validation error: {e}")
-                msg = create_dark_msg_box(self, "Ошибка", str(e), QMessageBox.Critical)
-                msg.exec_()
-                return
+            self.settings.set("video_backend", new_backend_str)
 
-        # Если все проверки прошли - сохраняем
-        self.settings.set("use_proxy", self.cb_use_proxy.isChecked())
+            new_effort = self.combo_lookback.currentData()
+            self.settings.set("seek_effort", new_effort)
 
-        ask_proxy = self.cb_ask_proxy.isChecked()
-        self.settings.set("ask_proxy_creation", ask_proxy)
+            self.settings.save()
 
-        new_q = self.combo_quality.currentData()
-        self.settings.set("proxy_quality", new_q)
+            if (
+                new_q != self.old_quality
+                or new_codec != self.old_codec
+                or new_backend_str != old_backend
+                or ask_proxy != self.old_ask_proxy
+            ):
+                self.need_restart = True
 
-        new_codec = self.combo_codec.currentData()
-        self.settings.set("proxy_codec", new_codec)
+            self.accept()
 
-        self.settings.set("cache_size", self.spin_cache.value())
-        self.settings.set("use_gpu", self.cb_gpu.isChecked())
+        except Exception as e:
+            # Заменяем print на logger или безопасный вывод
+            if logger:
+                logger.error(e)
 
-        self.settings.set("video_backend", new_backend_str)
+            tb = "".join(traceback.format_tb(e.__traceback__))
+            error_msg = f"Ошибка:\n{str(e)}\n\n{tb}"
 
-        new_effort = self.combo_lookback.currentData()
-        self.settings.set("seek_effort", new_effort)
-
-        self.settings.save()
-
-        if (
-            new_q != self.old_quality
-            or new_codec != self.old_codec
-            or new_backend_str != old_backend
-            or ask_proxy != self.old_ask_proxy
-        ):
-            self.need_restart = True
-
-        self.accept()
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Критическая ошибка")
+            msg.setText("Не удалось применить настройки.")
+            msg.setDetailedText(error_msg)
+            msg.setIcon(QMessageBox.Critical)
+            msg.setStyleSheet("background-color: #2b2b2b; color: #fff;")
+            msg.exec_()
 
 
 class SplitDialog(QDialog):
@@ -587,13 +618,15 @@ class SplitDialog(QDialog):
         self.btn_left.setMinimumHeight(45)
         self.btn_left.setCursor(Qt.PointingHandCursor)
         self.btn_left.setFocusPolicy(Qt.StrongFocus)
-        self.btn_left.clicked.connect(self.select_left)
+        # Lambda fix
+        self.btn_left.clicked.connect(lambda: self.select_left())
 
         self.btn_right = QPushButton("Отнести к ПРАВОМУ (2 или D)")
         self.btn_right.setMinimumHeight(45)
         self.btn_right.setCursor(Qt.PointingHandCursor)
         self.btn_right.setFocusPolicy(Qt.StrongFocus)
-        self.btn_right.clicked.connect(self.select_right)
+        # Lambda fix
+        self.btn_right.clicked.connect(lambda: self.select_right())
 
         layout.addWidget(self.btn_left)
         layout.addWidget(self.btn_right)

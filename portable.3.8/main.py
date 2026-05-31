@@ -4,6 +4,7 @@ import copy
 import os
 import sys
 import time
+import traceback  # Импорт для трассировки ошибок
 
 import cv2
 from dialogs import (
@@ -57,7 +58,7 @@ from utils import (
     stop_playback,
     undoable,
 )
-from video_engine import IS_DEBUG, ProxyGeneratorThread
+from video_engine import IS_DEBUG, ProxyGeneratorThread, logger
 from video_thread import VideoThread
 
 if IS_DEBUG:
@@ -77,6 +78,49 @@ try:
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
 except ImportError:
     pass
+
+
+# --- ГЛОБАЛЬНЫЙ ПЕРЕХВАТЧИК ОШИБОК ---
+def global_exception_hook(exctype, value, tb):
+    """
+    Перехватывает любые необработанные ошибки и показывает их в окне
+    Работает даже в скомпилированном exe
+    """
+    error_msg = "".join(traceback.format_exception(exctype, value, tb))
+    print("CRITICAL ERROR:", error_msg)
+
+    try:
+        if "logger" in globals():
+            logger.file(f"GLOBAL CRASH: {error_msg}")
+    except:
+        pass
+
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(
+            0,
+            f"Critical Error:\n{str(value)}\n\nSee log for details.",
+            "ProSportsAnalyzer Crash",
+            0x10,
+        )
+    except:
+        pass
+
+    try:
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Critical)
+        msg.setText("Critical Error")
+        msg.setInformativeText(str(value))
+        msg.setDetailedText(error_msg)
+        msg.exec_()
+    except:
+        pass
+
+    sys.__excepthook__(exctype, value, tb)
+
+
+sys.excepthook = global_exception_hook
 
 
 class ProSportsAnalyzer(QMainWindow):
@@ -405,6 +449,23 @@ class ProSportsAnalyzer(QMainWindow):
 
         self.fix_focus_policies()
         self.update_ui_marker_controls()
+
+        # ПОКАЗАТЬ, КУДА ПИШУТСЯ ЛОГИ ПРИ СТАРТЕ
+        self.show_log_path_info()
+
+    def show_log_path_info(self):
+        # Только если это скомпилированная версия
+        if not IS_DEBUG:
+            try:
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Info")
+                msg.setText(f"Файл логов находится здесь:\n{logger.log_path}")
+                msg.setIcon(QMessageBox.Information)
+                msg.setStyleSheet("background-color: #2b2b2b; color: #fff;")
+                # msg.exec_() # Раскомментируйте, если хотите видеть это окно при каждом запуске
+                logger.file(f"APP STARTED. Log path: {logger.log_path}")
+            except:
+                pass
 
     def fix_focus_policies(self):
         # Используем ClickFocus, чтобы кнопки можно было нажимать мышью,
@@ -924,7 +985,7 @@ class ProSportsAnalyzer(QMainWindow):
                     mark["frame"] = int(mark["frame"] * ratio)
 
     def set_video_info(self, info):
-        print(f"[DEBUG] set_video_info called: {info}")
+        logger.debug(f"set_video_info called: {info}")
         self.fps = info["fps"]
         self.total_frames = info["total"]
 
@@ -939,7 +1000,7 @@ class ProSportsAnalyzer(QMainWindow):
             # Prevent drift: Only remap if FPS difference is significant
             if abs(self.fps - old_fps) > 0.1 and old_fps > 0:
                 ratio = self.fps / old_fps
-                print(
+                logger.debug(
                     f"FPS changed: {old_fps:.2f} -> {self.fps:.2f}. Remapping history."
                 )
 
@@ -1038,7 +1099,7 @@ class ProSportsAnalyzer(QMainWindow):
             self.draw_frame(self.last_frame)
 
     def draw_frame(self, frame):
-        # print("[DEBUG] draw_frame called")
+        # logger.debug("draw_frame called")
         if frame is None:
             return
         h_orig, w_orig, ch = frame.shape
@@ -1100,10 +1161,10 @@ class ProSportsAnalyzer(QMainWindow):
                 cropped, (target_w, target_h), interpolation=interp
             )
         except cv2.error:
-            print("[DEBUG] cv2.error in resize")
+            logger.debug("cv2.error in resize")
             return
 
-        # print("[DEBUG] converting color")
+        # logger.debug("converting color")
         rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
 
         # Safer QImage creation without immediate .copy() on potentially unstable memory
@@ -1111,16 +1172,16 @@ class ProSportsAnalyzer(QMainWindow):
         height, width, channel = rgb.shape
         bytesPerLine = 3 * width
 
-        # print(f"[DEBUG] Creating QImage: {width}x{height}, line={bytesPerLine}")
+        # logger.debug(f"Creating QImage: {width}x{height}, line={bytesPerLine}")
 
         # NOTE: We keep a reference to 'rgb' only as long as qimg is needed for conversion
         # QPixmap.fromImage makes a deep copy into video memory immediately
         qimg = QImage(rgb.data, width, height, bytesPerLine, QImage.Format_RGB888)
 
-        # print("[DEBUG] Creating Pixmap")
+        # logger.debug("Creating Pixmap")
         pixmap = QPixmap.fromImage(qimg)
 
-        # print("[DEBUG] Starting Painter")
+        # logger.debug("Starting Painter")
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -1162,15 +1223,15 @@ class ProSportsAnalyzer(QMainWindow):
         from video_engine import IS_DEBUG
 
         if IS_DEBUG:
-            # print("[DEBUG] Drawing debug overlay")
+            # logger.debug("Drawing debug overlay")
             self.draw_debug_overlay(painter, pixmap.width(), pixmap.height())
 
         painter.end()
-        # print("[DEBUG] Setting Pixmap")
+        # logger.debug("Setting Pixmap")
         self.video_label.setPixmap(pixmap)
         self.timeline.set_current_frame(self.current_frame)
         self.calculate_stats()
-        # print("[DEBUG] draw_frame finished")
+        # logger.debug("draw_frame finished")
 
     def draw_debug_overlay(self, painter, w, h):
         # Replaced Mutex Lock with Try/Except
@@ -1220,7 +1281,7 @@ class ProSportsAnalyzer(QMainWindow):
             # Dictionary changed size during iteration, just skip this frame's debug
             pass
         except Exception as e:
-            print(f"[DEBUG] Overlay error: {e}")
+            logger.debug(f"Overlay error: {e}")
 
     def draw_overlay_text(self, painter, text, x, y, bg_alpha=150):
         font = QFont("Segoe UI", 16, QFont.Bold)
